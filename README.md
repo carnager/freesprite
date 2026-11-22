@@ -15,7 +15,9 @@ Characters are made of **parts** (head, torso, arm…) that are drawn once. **An
 - Export: spritesheet, Aseprite-style JSON, Godot 4 `SpriteFrames`, portraits and GIFs (also animated inside a room)
 - `pixelate` turns generated backgrounds into palette-limited pixel art
 
-## Build
+## Install
+
+Arch Linux: a PKGBUILD is in `packaging/arch/`. Or build it yourself:
 
 ```sh
 cargo build --release

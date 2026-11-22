@@ -1,0 +1,39 @@
+# Maintainer: Rasmus Steinke <rasi@xssn.at>
+pkgname=freesprite-git
+pkgver=r0.g0000000
+pkgrel=1
+pkgdesc='A pixel-art sprite editor for AI agents over MCP: parts-based animation, keyed palettes, Godot export'
+arch=(x86_64 aarch64)
+url='https://github.com/carnager/freesprite'
+license=(unknown)
+depends=(gcc-libs glibc)
+makedepends=(cargo git)
+provides=(freesprite)
+conflicts=(freesprite)
+source=("freesprite::git+https://github.com/carnager/freesprite.git")
+sha256sums=('SKIP')
+options=(!lto)
+
+pkgver() {
+  cd freesprite
+  printf 'r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd freesprite
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd freesprite
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd freesprite
+  install -Dm755 target/release/freesprite "$pkgdir/usr/bin/freesprite"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/SPEC.md "$pkgdir/usr/share/doc/$pkgname/SPEC.md"
+}
