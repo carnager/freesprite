@@ -25,3 +25,7 @@ claude mcp add freesprite -- "$PWD/target/release/freesprite"
 ```
 
 Any MCP client works: the binary speaks MCP over stdio.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

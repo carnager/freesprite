@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc='A pixel-art sprite editor for AI agents over MCP: parts-based animation, keyed palettes, Godot export'
 arch=(x86_64 aarch64)
 url='https://github.com/carnager/freesprite'
-license=(unknown)
+license=(MIT)
 depends=(gcc-libs glibc)
 makedepends=(cargo git)
 provides=(freesprite)
@@ -36,4 +36,5 @@ package() {
   install -Dm755 target/release/freesprite "$pkgdir/usr/bin/freesprite"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/SPEC.md "$pkgdir/usr/share/doc/$pkgname/SPEC.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
