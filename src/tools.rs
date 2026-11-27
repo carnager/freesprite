@@ -199,6 +199,8 @@ struct PaletteFromImage {
     region: Option<[u32; 4]>,
     #[serde(default)]
     append: bool,
+    key_color: Option<String>,
+    key_tolerance: Option<i32>,
 }
 #[derive(Deserialize)]
 struct PartNew {
@@ -257,7 +259,35 @@ struct PartImport {
     quantize: bool,
     alpha_threshold: Option<u8>,
     key_color: Option<String>,
+    key_tolerance: Option<i32>,
+    #[serde(default = "yes")]
+    key_spill: bool,
+    #[serde(default)]
+    trim: bool,
+    #[serde(default)]
+    drop_islands: bool,
+    downscale: Option<String>,
+    ink: Option<f32>,
+    ink_level: Option<f32>,
     pivot: Option<[f32; 2]>,
+}
+
+/// "box" (default) or "lineart" resizing; validated so typos don't silently fall back.
+fn resize_with(img: &RgbaImage, w: u32, h: u32, mode: Option<&str>, ink: Option<f32>, ink_level: Option<f32>) -> Result<RgbaImage> {
+    match mode.unwrap_or("box") {
+        "box" => Ok(render::box_resize(img, w, h)),
+        "lineart" => {
+            let mut o = render::LineArt::default();
+            if let Some(v) = ink {
+                o.ink = v.clamp(0.01, 1.0);
+            }
+            if let Some(v) = ink_level {
+                o.ink_level = v.clamp(0.0, 1.0);
+            }
+            Ok(render::lineart_resize(img, w, h, o))
+        }
+        m => bail!("downscale must be 'box' or 'lineart', got '{m}'"),
+    }
 }
 #[derive(Deserialize)]
 struct PartExtract {
@@ -433,6 +463,9 @@ struct Pixelate {
     sprite_palette: Option<String>,
     dither: Option<String>,
     dither_strength: Option<f32>,
+    downscale: Option<String>,
+    ink: Option<f32>,
+    ink_level: Option<f32>,
 }
 #[derive(Deserialize)]
 struct SpriteRef {
@@ -779,6 +812,11 @@ impl Workspace {
                 if let Some([x, y, w, h]) = a.region {
                     img = image::imageops::crop_imm(&img, x, y, w, h).to_image();
                 }
+                if let Some(k) = &a.key_color {
+                    // background out first, so it neither becomes a palette color nor bleeds into edges
+                    let kc = parse_hex(k).map_err(|_| anyhow!("key_color must be #hex here (the sprite's palette is being replaced)"))?;
+                    render::key_out(&mut img, kc, a.key_tolerance.unwrap_or(40).clamp(0, 765), true);
+                }
                 // subsample large images for speed
                 while img.width() * img.height() > 400_000 {
                     img = render::box_resize(&img, img.width() / 2, img.height() / 2);
@@ -921,18 +959,37 @@ impl Workspace {
                 self.mutate(&a.sprite, |s| {
                     if let Some(k) = &a.key_color {
                         let kc = parse_color(k, &s.palette)?;
-                        for p in img.pixels_mut() {
-                            let d: i32 = (0..3).map(|i| (p[i] as i32 - kc[i] as i32).abs()).sum();
-                            if d < 40 {
-                                *p = CLEAR;
-                            }
-                        }
+                        render::key_out(&mut img, kc, a.key_tolerance.unwrap_or(40).clamp(0, 765), a.key_spill);
+                    }
+                    if a.drop_islands {
+                        // pieces under 2% of the main figure: neighbours on a model sheet, specks
+                        render::drop_islands(&mut img, 0.02);
+                    }
+                    if a.trim {
+                        let (w, h) = img.dimensions();
+                        let opaque = |x: u32, y: u32| img.get_pixel(x, y)[3] > 127;
+                        let ys: Vec<u32> = (0..h).filter(|y| (0..w).any(|x| opaque(x, *y))).collect();
+                        let xs: Vec<u32> = (0..w).filter(|x| (0..h).any(|y| opaque(*x, y))).collect();
+                        let (Some(y0), Some(y1), Some(x0), Some(x1)) = (ys.first(), ys.last(), xs.first(), xs.last()) else {
+                            bail!("nothing left to import after keying (check key_color / region)");
+                        };
+                        img = image::imageops::crop_imm(&img, *x0, *y0, x1 - x0 + 1, y1 - y0 + 1).to_image();
                     }
                     if let Some([w, h]) = a.size {
-                        if w == 0 || h == 0 || w > 1024 || h > 1024 {
+                        let (sw, sh) = img.dimensions();
+                        // a 0 keeps the aspect ratio
+                        let (w, h) = match (w, h) {
+                            (0, 0) => bail!("size needs at least one non-zero side"),
+                            (0, h) => (((sw as u64 * h as u64) / sh.max(1) as u64).max(1) as u32, h),
+                            (w, 0) => (w, ((sh as u64 * w as u64) / sw.max(1) as u64).max(1) as u32),
+                            wh => wh,
+                        };
+                        if w > 1024 || h > 1024 {
                             bail!("size must be 1..=1024");
                         }
-                        img = render::box_resize(&img, w, h);
+                        img = resize_with(&img, w, h, a.downscale.as_deref(), a.ink, a.ink_level)?;
+                    } else if a.downscale.is_some() {
+                        bail!("downscale needs size");
                     }
                     if img.width() > 1024 || img.height() > 1024 {
                         bail!("imported image is {}x{}; pass size to scale it down", img.width(), img.height());
@@ -941,8 +998,16 @@ impl Workspace {
                     if a.quantize {
                         quantize_to(&mut img, &s.palette.colors())?;
                     }
-                    let pivot = a.pivot.unwrap_or([img.width() as f32 / 2.0, img.height() as f32 / 2.0]);
                     let (w, h) = img.dimensions();
+                    // replacing a part keeps where its pivot sits (scaled to the new size), so the
+                    // rig and animations don't jump; a new part gets the center
+                    let pivot = a.pivot.unwrap_or_else(|| match s.parts.get(&a.part) {
+                        Some(old) => {
+                            let (ow, oh) = (old.img.width().max(1) as f32, old.img.height().max(1) as f32);
+                            [(old.pivot[0] / ow * w as f32).round(), (old.pivot[1] / oh * h as f32).round()]
+                        }
+                        None => [w as f32 / 2.0, h as f32 / 2.0],
+                    });
                     s.parts.insert(a.part.clone(), Part { pivot, img });
                     Ok(vec![Out::Text(format!("imported '{}' {w}x{h} pivot {pivot:?}", a.part)), part_preview(s, &a.part)?])
                 })
@@ -1392,7 +1457,7 @@ impl Workspace {
                 if a.width == 0 || h == 0 || a.width > 4096 || h > 4096 {
                     bail!("bad target size {}x{h}", a.width);
                 }
-                let mut img = render::box_resize(&src, a.width, h);
+                let mut img = resize_with(&src, a.width, h, a.downscale.as_deref(), a.ink, a.ink_level)?;
                 let pal: Option<Vec<Px>> = match (&a.sprite_palette, a.colors) {
                     (Some(sp), _) => Some(self.doc(sp)?.sprite.palette.colors()),
                     (None, Some(n)) => {
@@ -1883,6 +1948,7 @@ pub fn definitions() -> Vec<Value> {
          {op:'shade', light?:[dx,dy] (default [-1,-1] = top-left), depth?:1, highlight?:0, steps?:1, colors?, rect?, edge?:'ramp'|'color'|'alpha'} — \
          cel shading along palette ramps: pixels within depth of their region's far side get darker, within highlight of the lit side lighter\n\
          {op:'ramp', steps, rect?, points?, colors?} — step pixels along their ramp (negative = darker)\n\
+         {op:'unjag', colors?, level?, passes?} — remove doubled corners from line work (after a lineart import): the elbow of every L of line pixels takes the color of the cell it cuts off\n\
          {op:'contour', of, color?|selout?, against?, diagonal?} — inner lines: pixels of color 'of' touching another color become color (selout: darkest of of's ramp)\n\
          {op:'rect', x,y,w,h, color, fill?, pattern?, color2?}\n\
          {op:'ellipse', x,y,w,h, color, fill?, pattern?, color2?} — bounding box\n\
@@ -1895,7 +1961,7 @@ pub fn definitions() -> Vec<Value> {
          {op:'flip', h?, v?}\n\
          {op:'clear', rect?:[x,y,w,h]}\n\
          {op:'copy', from:[x,y,w,h], to:[x,y]}",
-        "properties": {"op": {"type": "string", "enum": ["rows","pixels","line","curve","rect","ellipse","polygon","fill","replace","outline","contour","shade","ramp","mirror","shift","flip","clear","copy"]}},
+        "properties": {"op": {"type": "string", "enum": ["rows","pixels","line","curve","rect","ellipse","polygon","fill","replace","outline","unjag","contour","shade","ramp","mirror","shift","flip","clear","copy"]}},
         "required": ["op"]});
 
     vec![
@@ -1918,7 +1984,9 @@ pub fn definitions() -> Vec<Value> {
         }), &["sprite", "name"]),
         tool("palette_from_image", "Extract a palette from an image (e.g. a game background) with median cut, so the character matches the scene.", json!({
             "sprite": sprite, "image": {"type": "string"}, "colors": {"type": "integer", "description": "max 62"},
-            "region": rect, "append": {"type": "boolean", "description": "add to existing palette instead of replacing"}
+            "region": rect, "append": {"type": "boolean", "description": "add to existing palette instead of replacing"},
+            "key_color": {"type": "string", "description": "#hex background to ignore (with its fringes), e.g. the magenta behind a model sheet"},
+            "key_tolerance": {"type": "integer", "description": "summed RGB distance still counted as the key (default 40)"}
         }), &["sprite", "image", "colors"]),
         tool("part_new", "Create an empty part.", json!({
             "sprite": sprite, "part": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"},
@@ -1932,12 +2000,19 @@ pub fn definitions() -> Vec<Value> {
         tool("part_duplicate", "Copy a part (optionally mirrored) under a new name — e.g. to make a variant like arm_bent.", json!({
             "sprite": sprite, "part": {"type": "string"}, "new_name": {"type": "string"}, "flip_h": {"type": "boolean"}, "flip_v": {"type": "boolean"}
         }), &["sprite", "part", "new_name"]),
-        tool("part_import", "Create/replace a part from an image file (e.g. a generated character), optionally cropped, scaled down (box filter), background-keyed and snapped to the palette.", json!({
+        tool("part_import", "Create/replace a part from an image file (e.g. one figure of a generated model sheet): crop to region, key out the background, trim to the drawing, scale down and snap to the palette. For cartoon art with dark outlines use downscale='lineart': a box filter turns outlines into mush, lineart keeps them crisp and takes each pixel's dominant color.", json!({
             "sprite": sprite, "part": {"type": "string"}, "image": {"type": "string"}, "region": rect,
-            "size": {"type": "array", "items": {"type": "integer"}, "description": "[w, h] target size"},
+            "size": {"type": "array", "items": {"type": "integer"}, "description": "[w, h] target size; 0 for one side keeps the aspect ratio (e.g. [0, 100])"},
+            "downscale": {"type": "string", "enum": ["box", "lineart"], "description": "box (default, for painted or soft art) or lineart (outlined cartoon art)"},
+            "ink": {"type": "number", "description": "lineart: share of a block that must be ink to become ink (default 0.22; lower = bolder lines)"},
+            "ink_level": {"type": "number", "description": "lineart: perceived lightness 0-1 below which a pixel counts as ink (default 0.3)"},
             "quantize": {"type": "boolean", "description": "snap colors to the sprite palette"},
             "alpha_threshold": {"type": "integer", "description": "alpha below this becomes transparent (default 128)"},
-            "key_color": {"type": "string", "description": "make this background color transparent"},
+            "key_color": {"type": "string", "description": "make this background color transparent (e.g. #ff00ff)"},
+            "key_tolerance": {"type": "integer", "description": "summed RGB distance still counted as the key (default 40)"},
+            "key_spill": {"type": "boolean", "description": "also remove pixels of the key's hue: anti-aliased fringes and key/outline mixes (default true for saturated keys)"},
+            "trim": {"type": "boolean", "description": "crop to the drawing after keying, so region can be rough"},
+            "drop_islands": {"type": "boolean", "description": "remove detached pieces under 2% of the main figure (bits of neighbouring figures on a model sheet) before trimming"},
             "pivot": pt2f
         }), &["sprite", "part", "image"]),
         tool("part_extract", "Copy a rectangle of one part into a new part (cut=true erases it from the source). Use to split an imported full character into limbs.", json!({
@@ -2033,7 +2108,10 @@ pub fn definitions() -> Vec<Value> {
             "image": {"type": "string"}, "output": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"},
             "colors": {"type": "integer"}, "sprite_palette": {"type": "string", "description": "sprite whose palette to use"},
             "dither": {"type": "string", "enum": ["none", "bayer", "floyd"], "description": "bayer = ordered retro VGA look, floyd = error diffusion; fights banding in skies/water"},
-            "dither_strength": {"type": "number", "description": "0-2 (default 1, floyd 0.75)"}
+            "dither_strength": {"type": "number", "description": "0-2 (default 1, floyd 0.75)"},
+            "downscale": {"type": "string", "enum": ["box", "lineart"], "description": "box (default, painted art) or lineart (outlined cartoon art)"},
+            "ink": {"type": "number", "description": "lineart: share of a block that must be ink (default 0.22)"},
+            "ink_level": {"type": "number", "description": "lineart: lightness 0-1 below which a pixel is ink (default 0.3)"}
         }), &["image", "output", "width"]),
         tool("undo", "Undo the last change to a sprite.", json!({"sprite": sprite}), &["sprite"]),
         tool("redo", "Redo.", json!({"sprite": sprite}), &["sprite"]),

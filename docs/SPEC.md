@@ -127,6 +127,8 @@ Extract a palette from an image (e.g. a game background) with median cut, so the
 | `append` | boolean |  | add to existing palette instead of replacing |
 | `colors` | integer | yes | max 62 |
 | `image` | string | yes |  |
+| `key_color` | string |  | #hex background to ignore (with its fringes), e.g. the magenta behind a model sheet |
+| `key_tolerance` | integer |  | summed RGB distance still counted as the key (default 40) |
 | `region` | [integer; 4] |  | [x, y, w, h] |
 | `sprite` | string | yes | sprite name (or its directory path) |
 
@@ -177,19 +179,26 @@ Copy a part (optionally mirrored) under a new name — e.g. to make a variant li
 
 ### `part_import`
 
-Create/replace a part from an image file (e.g. a generated character), optionally cropped, scaled down (box filter), background-keyed and snapped to the palette.
+Create/replace a part from an image file (e.g. one figure of a generated model sheet): crop to region, key out the background, trim to the drawing, scale down and snap to the palette. For cartoon art with dark outlines use downscale='lineart': a box filter turns outlines into mush, lineart keeps them crisp and takes each pixel's dominant color.
 
 | Param | Type | Required | Notes |
 |---|---|---|---|
 | `alpha_threshold` | integer |  | alpha below this becomes transparent (default 128) |
+| `downscale` | `box` \| `lineart` |  | box (default, for painted or soft art) or lineart (outlined cartoon art) |
+| `drop_islands` | boolean |  | remove detached pieces under 2% of the main figure (bits of neighbouring figures on a model sheet) before trimming |
 | `image` | string | yes |  |
-| `key_color` | string |  | make this background color transparent |
+| `ink` | number |  | lineart: share of a block that must be ink to become ink (default 0.22; lower = bolder lines) |
+| `ink_level` | number |  | lineart: perceived lightness 0-1 below which a pixel counts as ink (default 0.3) |
+| `key_color` | string |  | make this background color transparent (e.g. #ff00ff) |
+| `key_spill` | boolean |  | also remove pixels of the key's hue: anti-aliased fringes and key/outline mixes (default true for saturated keys) |
+| `key_tolerance` | integer |  | summed RGB distance still counted as the key (default 40) |
 | `part` | string | yes |  |
 | `pivot` | [number; 2] |  |  |
 | `quantize` | boolean |  | snap colors to the sprite palette |
 | `region` | [integer; 4] |  | [x, y, w, h] |
-| `size` | integer[] |  | [w, h] target size |
+| `size` | integer[] |  | [w, h] target size; 0 for one side keeps the aspect ratio (e.g. [0, 100]) |
 | `sprite` | string | yes | sprite name (or its directory path) |
+| `trim` | boolean |  | crop to the drawing after keying, so region can be rough |
 
 ### `part_extract`
 
@@ -445,8 +454,11 @@ Turn any image (PNG/JPEG/WebP, e.g. a generated background) into pixel art: box-
 | `colors` | integer |  |  |
 | `dither` | `none` \| `bayer` \| `floyd` |  | bayer = ordered retro VGA look, floyd = error diffusion; fights banding in skies/water |
 | `dither_strength` | number |  | 0-2 (default 1, floyd 0.75) |
+| `downscale` | `box` \| `lineart` |  | box (default, painted art) or lineart (outlined cartoon art) |
 | `height` | integer |  |  |
 | `image` | string | yes |  |
+| `ink` | number |  | lineart: share of a block that must be ink (default 0.22) |
+| `ink_level` | number |  | lineart: lightness 0-1 below which a pixel is ink (default 0.3) |
 | `output` | string | yes |  |
 | `sprite_palette` | string |  | sprite whose palette to use |
 | `width` | integer | yes |  |
@@ -478,6 +490,7 @@ Passed as `ops` to `draw`, applied in order. Coordinates are part-local. Shapes 
 - `{op:'mirror', axis?:'x'|'y', at?, from?}`: copy one half onto the other, mirrored. `at` is the mirror line in pixel-edge coordinates (default: the middle; on odd sizes the center column maps to itself). `from` is `'left'`/`'right'` or `'top'`/`'bottom'` (default left/top). Draw half a face or body, mirror, then add the asymmetric details.
 - `{op:'shade', light?:[dx,dy], depth?, highlight?, steps?, colors?, rect?, edge?}`: cel shading along palette ramps from one light direction (default `[-1,-1]`, top-left). Pixels within `depth` (default 1) of their region's far side step `steps` (default 1) shades darker; with `highlight` > 0, pixels that close to the lit side step lighter. A region ends where the ramp changes (`edge:'ramp'`, default), the color changes (`'color'`) or at transparency (`'alpha'`). Colors without a ramp are untouched. Run it before `outline`.
 - `{op:'ramp', steps, rect?, points?, colors?}`: step pixels along their ramp (negative = darker), for hand-placed shading touches.
+- `{op:'unjag', colors?, level?, passes?}`: remove doubled corners from line work. In every 2x2 block where three line pixels form an L, the elbow takes the color of the fourth cell. Line pixels are `colors`, or anything darker than `level` (perceived lightness, default 0.3). Use it after a `lineart` import, where outlines come out 1-2 px thick.
 - `{op:'contour', of, color?, selout?, against?, diagonal?}`: inner line work. Pixels of color `of` that touch a different opaque color (or only `against`) become `color`, or with `selout` the darkest shade of `of`'s ramp. Example: the edge of a vest against the shirt.
 - `{op:'rect', x,y,w,h, color, fill?, pattern?, color2?}`
 - `{op:'ellipse', x,y,w,h, color, fill?, pattern?, color2?}`: bounding box

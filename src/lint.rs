@@ -90,6 +90,26 @@ pub fn lint(s: &Sprite, outline: Option<Px>) -> Result<String> {
                 }
             }
         }
+        let isl = render::islands(img);
+        if let Some(big) = isl.first().map(|c| c.len()) {
+            let small: Vec<String> = isl
+                .iter()
+                .skip(1)
+                .filter(|c| c.len() > 1 && c.len() * 50 < big)
+                .map(|c| {
+                    let (x0, y0) = c.iter().fold((u32::MAX, u32::MAX), |(a, b), (x, y)| (a.min(*x), b.min(*y)));
+                    let (x1, y1) = c.iter().fold((0, 0), |(a, b), (x, y)| (a.max(*x), b.max(*y)));
+                    format!("{} px at [{x0}, {y0}, {}, {}]", c.len(), x1 - x0 + 1, y1 - y0 + 1)
+                })
+                .collect();
+            if !small.is_empty() {
+                out.push(format!(
+                    "part '{name}': {} small detached piece(s), maybe strays from a model sheet (clear with draw clear rect, or re-import with drop_islands): {}",
+                    small.len(),
+                    small.join("; ")
+                ));
+            }
+        }
         if !orphans.is_empty() {
             out.push(format!("part '{name}': {} orphan pixels (no neighbours): {}", orphans.len(), list(&orphans)));
         }

@@ -583,3 +583,105 @@ fn spec_documents_every_tool_and_op() {
         assert!(spec.contains(&format!("op:'{op}'")), "docs/SPEC.md lacks draw op '{op}'");
     }
 }
+
+#[test]
+fn lineart_downscale_keeps_outlines() {
+    // a 40x40 white square with a 4px black frame, shrunk 10x
+    let mut img = RgbaImage::from_pixel(40, 40, Rgba([255, 255, 255, 255]));
+    for y in 0..40 {
+        for x in 0..40 {
+            if !(4..36).contains(&x) || !(4..36).contains(&y) {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+    }
+    let line = render::lineart_resize(&img, 4, 4, render::LineArt::default());
+    let boxed = render::box_resize(&img, 4, 4);
+    let dark = |p: &Rgba<u8>| p[0] < 40;
+    assert!(dark(line.get_pixel(0, 0)) && dark(line.get_pixel(3, 2)), "frame survives as ink");
+    assert_eq!(*line.get_pixel(1, 1), Rgba([255, 255, 255, 255]), "inside keeps its flat color");
+    assert!(!dark(boxed.get_pixel(0, 1)), "a box filter washes the same frame out");
+}
+
+#[test]
+fn key_spill_removes_magenta_fringes() {
+    let mut img = RgbaImage::new(3, 1);
+    img.put_pixel(0, 0, Rgba([255, 0, 255, 255])); // key
+    img.put_pixel(1, 0, Rgba([150, 20, 140, 255])); // fringe: key mixed with a dark outline
+    img.put_pixel(2, 0, Rgba([200, 40, 40, 255])); // a red jacket stays
+    render::key_out(&mut img, Rgba([255, 0, 255, 255]), 40, true);
+    assert_eq!(img.get_pixel(0, 0)[3], 0);
+    assert_eq!(img.get_pixel(1, 0)[3], 0);
+    assert_eq!(img.get_pixel(2, 0)[3], 255);
+}
+
+#[test]
+fn at_and_hash_work_as_palette_keys() {
+    let specs: Vec<crate::color::PalSpec> = serde_json::from_value(json!([{"key": "@", "color": "#102030"}, {"key": "#", "color": "#405060"}, "#000000"])).unwrap();
+    let p = palette_from_specs(&specs).unwrap();
+    assert_eq!(crate::color::parse_color("@", &p).unwrap(), Rgba([16, 32, 48, 255]));
+    assert_eq!(crate::color::parse_color("#", &p).unwrap(), Rgba([64, 80, 96, 255]));
+    assert_eq!(crate::color::parse_color("@2", &p).unwrap(), Rgba([0, 0, 0, 255]), "@N is still an index");
+}
+
+#[test]
+fn unjag_removes_l_corners_and_keeps_lines_connected() {
+    let p = pal();
+    let k = p.by_key('o').unwrap();
+    let mut img = RgbaImage::new(6, 6);
+    // a staircase drawn with doubled corners
+    for (x, y) in [(0, 0), (1, 0), (1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3)] {
+        img.put_pixel(x, y, k);
+    }
+    assert!(!no_doubles(&img, k));
+    draw::apply(&mut img, &op(json!({"op": "unjag", "colors": ["o"]})), &p).unwrap();
+    assert!(no_doubles(&img, k));
+    // still one connected line (8-connectivity) from end to end
+    let pts: Vec<(i32, i32)> = img.enumerate_pixels().filter(|(_, _, px)| **px == k).map(|(x, y, _)| (x as i32, y as i32)).collect();
+    let mut seen = vec![pts[0]];
+    let mut i = 0;
+    while i < seen.len() {
+        let (x, y) = seen[i];
+        for q in &pts {
+            if (q.0 - x).abs() <= 1 && (q.1 - y).abs() <= 1 && !seen.contains(q) {
+                seen.push(*q);
+            }
+        }
+        i += 1;
+    }
+    assert_eq!(seen.len(), pts.len());
+}
+
+#[test]
+fn unjag_leaves_dark_fills_alone() {
+    let p = pal();
+    let k = p.by_key('o').unwrap();
+    let mut img = RgbaImage::new(12, 12);
+    for y in 2..10 {
+        for x in 2..9 {
+            img.put_pixel(x, y, k); // a solid dark area (navy trousers, hair...)
+        }
+    }
+    img.put_pixel(9, 9, k); // plus a nub making L shapes on its edge
+    let before = img.clone();
+    draw::apply(&mut img, &op(json!({"op": "unjag", "passes": 4})), &p).unwrap();
+    let holes = (2..10).flat_map(|y| (2..9).map(move |x| (x, y))).filter(|(x, y)| img.get_pixel(*x, *y)[3] == 0).count();
+    assert_eq!(holes, 0, "no holes eaten into the fill");
+    assert_eq!(opaque(&img), opaque(&before));
+}
+
+#[test]
+fn islands_are_found_and_dropped() {
+    let mut img = RgbaImage::new(20, 10);
+    for y in 0..10 {
+        for x in 0..10 {
+            img.put_pixel(x, y, R); // the figure: 100 px
+        }
+    }
+    img.put_pixel(15, 5, K); // a stray from the next figure
+    img.put_pixel(16, 5, K);
+    assert_eq!(render::islands(&img).len(), 2);
+    assert_eq!(render::drop_islands(&mut img, 0.05), 1);
+    assert_eq!(render::islands(&img).len(), 1);
+    assert_eq!(img.get_pixel(5, 5), &R);
+}

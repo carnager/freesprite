@@ -38,6 +38,13 @@ pub fn parse_color(s: &str, pal: &Palette) -> Result<Px> {
     if t.eq_ignore_ascii_case("transparent") || t.eq_ignore_ascii_case("none") {
         return Ok(CLEAR);
     }
+    // a one-character palette key wins over every other syntax ('@' and '#' are valid keys)
+    let mut one = t.chars();
+    if let (Some(k), None) = (one.next(), one.next())
+        && let Some(c) = pal.by_key(k)
+    {
+        return Ok(c);
+    }
     if let Some(i) = t.strip_prefix('@') {
         let i: usize = i.parse().map_err(|_| anyhow!("bad palette index '{t}'"))?;
         return palette

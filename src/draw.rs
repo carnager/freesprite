@@ -55,6 +55,11 @@ pub enum Op {
     /// Step pixels along their palette ramp (negative = darker): all, those in rect, at points,
     /// and/or of the given colors.
     Ramp { steps: i32, rect: Option<[i32; 4]>, points: Option<Vec<[i32; 2]>>, colors: Option<Vec<String>> },
+    /// Remove doubled corners from line work: in every 2x2 block where three line pixels form an
+    /// L, the elbow pixel takes the color of the fourth cell. Line pixels are the given colors, or
+    /// any opaque pixel darker than `level` (perceived lightness, default 0.3). Good after a
+    /// lineart import, where outlines come out 1-2 px thick.
+    Unjag { colors: Option<Vec<String>>, level: Option<f32>, passes: Option<u32> },
     /// Inner contour lines: pixels of color `of` that touch a different opaque color (or only
     /// `against`) become `color`, or with selout the darkest shade of of's ramp.
     Contour {
@@ -631,6 +636,44 @@ pub fn apply(img: &mut RgbaImage, op: &Op, pal: &Palette) -> Result<()> {
                 }
             }
             let _ = no_ramp;
+        }
+        Op::Unjag { colors, level, passes } => {
+            let only = color_set(colors, pal)?;
+            let level = level.unwrap_or(0.3).clamp(0.0, 1.0);
+            let is_line = |p: Option<Px>| {
+                p.is_some_and(|p| p[3] > 0 && only.as_ref().map_or(crate::color::lightness(p) < level, |o| o.contains(&p)))
+            };
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            for _ in 0..passes.unwrap_or(2).clamp(1, 8) {
+                // in place, so each fix sees the previous one (two neighbouring elbows of a
+                // staircase must not both go)
+                let mut changed = false;
+                for y in 0..h - 1 {
+                    for x in 0..w - 1 {
+                        let cells = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)];
+                        let line: Vec<bool> = cells.iter().map(|(cx, cy)| is_line(get(img, *cx, *cy))).collect();
+                        if line.iter().filter(|b| **b).count() != 3 {
+                            continue;
+                        }
+                        let missing = line.iter().position(|b| !*b).unwrap();
+                        let (ex, ey) = cells[3 - missing];
+                        let (mx, my) = cells[missing];
+                        // only thin line work: an elbow inside a dark area or a thick stroke has
+                        // more than the two L neighbours and stays (else dark fills erode)
+                        let n4 = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().filter(|(dx, dy)| is_line(get(img, ex + dx, ey + dy))).count();
+                        if n4 != 2 {
+                            continue;
+                        }
+                        // the two remaining line pixels touch diagonally, so the line stays connected
+                        let fill = get(img, mx, my).unwrap_or(CLEAR);
+                        put(img, ex, ey, fill);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
         }
         Op::Contour { of, color, against, selout, diagonal } => {
             let of_c = col(of)?;

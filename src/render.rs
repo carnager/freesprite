@@ -281,6 +281,161 @@ pub fn box_resize(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
     })
 }
 
+/// Settings for [`lineart_resize`].
+#[derive(Clone, Copy, Debug)]
+pub struct LineArt {
+    /// share of a block that must be ink for the output pixel to become ink (0..1)
+    pub ink: f32,
+    /// perceived lightness (0..1) below which a source pixel counts as ink
+    pub ink_level: f32,
+    /// share of a block that must be opaque, else the pixel is transparent
+    pub coverage: f32,
+}
+
+impl Default for LineArt {
+    fn default() -> Self {
+        LineArt { ink: 0.22, ink_level: 0.3, coverage: 0.45 }
+    }
+}
+
+/// Downscale for cartoon line art (dark outlines + flat colors). Each output pixel covers a
+/// block of the source: enough ink makes it ink (darkened ink color, so lines stay crisp),
+/// otherwise it takes the block's dominant color (mode of coarse color bins, averaged inside the
+/// winning bin) instead of the blurry mean a box filter gives. Box-filtering the same art turns
+/// thick outlines into brown mush.
+pub fn lineart_resize(img: &RgbaImage, w: u32, h: u32, opt: LineArt) -> RgbaImage {
+    let (sw, sh) = img.dimensions();
+    let light: Vec<f32> = img.pixels().map(|p| crate::color::lightness(*p)).collect();
+    RgbaImage::from_fn(w, h, |x, y| {
+        let x0 = (x as u64 * sw as u64 / w as u64) as u32;
+        let x1 = (((x as u64 + 1) * sw as u64 / w as u64) as u32).max(x0 + 1).min(sw);
+        let y0 = (y as u64 * sh as u64 / h as u64) as u32;
+        let y1 = (((y as u64 + 1) * sh as u64 / h as u64) as u32).max(y0 + 1).min(sh);
+        let n = ((x1 - x0) * (y1 - y0)) as f32;
+        let (mut opaque, mut ink) = (0f32, [0u64; 4]);
+        let mut bins: std::collections::HashMap<u32, [u64; 4]> = Default::default();
+        for sy in y0..y1 {
+            for sx in x0..x1 {
+                let p = img.get_pixel(sx, sy);
+                if p[3] <= 127 {
+                    continue;
+                }
+                opaque += 1.0;
+                if light[(sy * sw + sx) as usize] < opt.ink_level {
+                    for i in 0..3 {
+                        ink[i] += p[i] as u64;
+                    }
+                    ink[3] += 1;
+                } else {
+                    let key = (p[0] as u32 / 24) << 16 | (p[1] as u32 / 24) << 8 | (p[2] as u32 / 24);
+                    let b = bins.entry(key).or_default();
+                    for i in 0..3 {
+                        b[i] += p[i] as u64;
+                    }
+                    b[3] += 1;
+                }
+            }
+        }
+        if opaque < opt.coverage * n {
+            return Rgba([0, 0, 0, 0]);
+        }
+        if ink[3] as f32 >= opt.ink * n || bins.is_empty() {
+            let c = ink[3].max(1);
+            return Rgba([(ink[0] / c / 2) as u8, (ink[1] / c / 2) as u8, (ink[2] / c / 2) as u8, 255]);
+        }
+        // dominant bin; ties broken by bin key so results are deterministic
+        let (_, b) = bins.iter().max_by_key(|(k, b)| (b[3], std::cmp::Reverse(**k))).unwrap();
+        Rgba([(b[0] / b[3]) as u8, (b[1] / b[3]) as u8, (b[2] / b[3]) as u8, 255])
+    })
+}
+
+/// 8-connected opaque islands (alpha > 127), largest first, as pixel lists.
+pub fn islands(img: &RgbaImage) -> Vec<Vec<(u32, u32)>> {
+    let (w, h) = img.dimensions();
+    let mut seen = vec![false; (w * h) as usize];
+    let mut out = vec![];
+    for y in 0..h {
+        for x in 0..w {
+            if seen[(y * w + x) as usize] || img.get_pixel(x, y)[3] <= 127 {
+                continue;
+            }
+            let mut comp = vec![];
+            let mut stack = vec![(x, y)];
+            seen[(y * w + x) as usize] = true;
+            while let Some((cx, cy)) = stack.pop() {
+                comp.push((cx, cy));
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                            continue;
+                        }
+                        let i = (ny as u32 * w + nx as u32) as usize;
+                        if !seen[i] && img.get_pixel(nx as u32, ny as u32)[3] > 127 {
+                            seen[i] = true;
+                            stack.push((nx as u32, ny as u32));
+                        }
+                    }
+                }
+            }
+            out.push(comp);
+        }
+    }
+    out.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    out
+}
+
+/// Clear islands smaller than `frac` of the largest one (bits of neighbouring figures on a model
+/// sheet, specks of background). Returns how many were removed.
+pub fn drop_islands(img: &mut RgbaImage, frac: f32) -> usize {
+    let isl = islands(img);
+    let Some(big) = isl.first().map(|c| c.len() as f32) else { return 0 };
+    let mut n = 0;
+    for c in isl.iter().skip(1).filter(|c| (c.len() as f32) < frac * big) {
+        for (x, y) in c {
+            img.put_pixel(*x, *y, Rgba([0, 0, 0, 0]));
+        }
+        n += 1;
+    }
+    n
+}
+
+fn hue_sat_val(p: Px) -> (f32, f32, f32) {
+    let (r, g, b) = (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+    let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+    let d = mx - mn;
+    let h = if d == 0.0 {
+        0.0
+    } else if mx == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, if mx == 0.0 { 0.0 } else { d / mx }, mx)
+}
+
+/// Make a background key color transparent. `tolerance` is the summed RGB distance that still
+/// counts as the key. With `spill`, pixels of the key's hue (anti-aliased fringes and mixes of the
+/// key with dark outlines) go too, which matters for saturated keys like magenta #ff00ff.
+pub fn key_out(img: &mut RgbaImage, key: Px, tolerance: i32, spill: bool) {
+    let (kh, ks, _) = hue_sat_val(key);
+    let spill = spill && ks > 0.5;
+    for p in img.pixels_mut() {
+        let d: i32 = (0..3).map(|i| (p[i] as i32 - key[i] as i32).abs()).sum();
+        let mut drop = d < tolerance;
+        if !drop && spill {
+            let (h, s, v) = hue_sat_val(*p);
+            let dh = ((h - kh + 540.0) % 360.0 - 180.0).abs();
+            drop = dh < 28.0 && s > 0.4 && v > 0.2;
+        }
+        if drop {
+            *p = Rgba([0, 0, 0, 0]);
+        }
+    }
+}
+
 // ---------- review sheet ----------
 
 const DIGITS: [[u8; 5]; 10] = [
