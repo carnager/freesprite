@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use image::{Rgba, RgbaImage};
 
 use crate::color::Px;
@@ -55,7 +55,54 @@ pub fn scale2x(img: &RgbaImage) -> RgbaImage {
     out
 }
 
-pub fn blit_pose(out: &mut RgbaImage, part: &Part, p: &Pose) {
+/// Where a part's pivot lands on the canvas and how the part is turned, after resolving parents.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Xform {
+    pub x: f32,
+    pub y: f32,
+    pub rot: f32,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+/// World transforms for a list of placements (parents resolved). Same order as `poses`.
+pub fn resolve(poses: &[Pose]) -> Result<Vec<Xform>> {
+    let mut done: Vec<Option<Xform>> = vec![None; poses.len()];
+    fn go(i: usize, poses: &[Pose], done: &mut Vec<Option<Xform>>, depth: usize) -> Result<Xform> {
+        if let Some(x) = done[i] {
+            return Ok(x);
+        }
+        if depth > poses.len() {
+            bail!("parent cycle through slot '{}'", poses[i].slot());
+        }
+        let p = &poses[i];
+        let x = match &p.parent {
+            None => Xform { x: p.x as f32, y: p.y as f32, rot: p.rot, flip_h: p.flip_h, flip_v: p.flip_v },
+            Some(par) => {
+                let j = poses
+                    .iter()
+                    .position(|q| q.slot() == par)
+                    .ok_or_else(|| anyhow!("slot '{}' has parent '{par}', which is not placed in this frame", p.slot()))?;
+                let pt = go(j, poses, done, depth + 1)?;
+                let fx = if pt.flip_h { -1.0 } else { 1.0 };
+                let fy = if pt.flip_v { -1.0 } else { 1.0 };
+                let (ox, oy) = (p.x as f32 * fx, p.y as f32 * fy);
+                let (s, c) = pt.rot.to_radians().sin_cos();
+                // a mirrored parent turns its children the other way
+                let sign = fx * fy;
+                let (x, y) = (pt.x + c * ox - s * oy, pt.y + s * ox + c * oy);
+                // keep unrotated chains on exact pixels
+                let snap = |v: f32| if (v - v.round()).abs() < 1e-3 { v.round() } else { v };
+                Xform { x: snap(x), y: snap(y), rot: pt.rot + sign * p.rot, flip_h: pt.flip_h ^ p.flip_h, flip_v: pt.flip_v ^ p.flip_v }
+            }
+        };
+        done[i] = Some(x);
+        Ok(x)
+    }
+    (0..poses.len()).map(|i| go(i, poses, &mut done, 0)).collect()
+}
+
+pub fn blit(out: &mut RgbaImage, part: &Part, p: &Xform) {
     let rot = p.rot.rem_euclid(360.0);
     let exact = (rot - (rot / 90.0).round() * 90.0).abs() < 1e-3;
     let (src, k): (Cow<RgbaImage>, f32) = if exact {
@@ -76,7 +123,7 @@ pub fn blit_pose(out: &mut RgbaImage, part: &Part, p: &Pose) {
     let [pvx, pvy] = part.pivot;
     let fx = if p.flip_h { -1.0 } else { 1.0 };
     let fy = if p.flip_v { -1.0 } else { 1.0 };
-    let (px, py) = (p.x as f32, p.y as f32);
+    let (px, py) = (p.x, p.y);
 
     let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for (cx, cy) in [(0.0, 0.0), (pw, 0.0), (0.0, ph), (pw, ph)] {
@@ -112,11 +159,23 @@ pub fn blit_pose(out: &mut RgbaImage, part: &Part, p: &Pose) {
 }
 
 pub fn compose(s: &Sprite, f: &Frame) -> Result<RgbaImage> {
-    let mut out = RgbaImage::new(s.width, s.height);
-    for pose in &f.poses {
-        blit_pose(&mut out, s.part(&pose.part)?, pose);
-    }
-    Ok(out)
+    compose_margin(s, f, 0)
+}
+
+/// Mirror around a vertical line at continuous x = `axis` (pixel edges at integers).
+pub fn mirror_h(img: &RgbaImage, axis: i32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    RgbaImage::from_fn(w, h, |x, y| {
+        let sx = 2 * axis - 1 - x as i32;
+        if sx >= 0 && (sx as u32) < w { *img.get_pixel(sx as u32, y) } else { Rgba([0, 0, 0, 0]) }
+    })
+}
+
+/// World transforms of a frame's placements (for markers / debugging).
+pub fn frame_xforms(s: &Sprite, f: &Frame) -> Result<Vec<(Pose, Xform)>> {
+    let poses = s.frame_poses(f)?;
+    let xs = resolve(&poses)?;
+    Ok(poses.into_iter().zip(xs).collect())
 }
 
 pub fn fade(img: &RgbaImage, a: f32) -> RgbaImage {
@@ -136,7 +195,7 @@ pub fn backdrop(w: u32, h: u32, bg: Option<Px>, cell: u32) -> RgbaImage {
     RgbaImage::from_fn(w, h, |x, y| match bg {
         Some(c) => c,
         None => {
-            if ((x / cell) + (y / cell)) % 2 == 0 {
+            if ((x / cell) + (y / cell)).is_multiple_of(2) {
                 Rgba([200, 200, 205, 255])
             } else {
                 Rgba([232, 232, 236, 255])
@@ -186,7 +245,7 @@ pub fn grid(rows: &[Vec<RgbaImage>], k: u32, bg: Option<Px>) -> RgbaImage {
 pub fn auto_scale(w: u32, h: u32, across: u32, down: u32) -> u32 {
     let by_w = 1600 / (w * across.max(1)).max(1);
     let by_h = 1200 / (h * down.max(1)).max(1);
-    by_w.min(by_h).min(12).max(1)
+    by_w.min(by_h).clamp(1, 12)
 }
 
 /// Box-filter resize (premultiplied alpha). Good for downscaling; acts like nearest when upscaling.
@@ -319,17 +378,18 @@ pub fn review(img: &RgbaImage, strip: Option<&[RgbaImage]>, zoom: Option<u32>, m
     let pad = 8u32;
     let one = present(img, 1, None);
     let sil = silhouette(img, 2);
+    let val = value_view(img, 2);
     let zg = zoom_grid(img, k, mark);
     let strip_img = strip.filter(|f| f.len() > 1).map(|f| {
         let sk = (1400 / (w * f.len() as u32).max(1)).clamp(1, 4);
         grid(&[f.to_vec()], sk, None)
     });
-    let top_w = pad + one.width() + pad + sil.width() + pad + zg.width() + pad;
+    let top_w = pad + one.width() + pad + sil.width() + pad + val.width() + pad + zg.width() + pad;
     let top_h = zg.height().max(sil.height()).max(one.height()) + 2 * pad;
     let (sw, sh) = strip_img.as_ref().map(|s| (s.width() + 2 * pad, s.height() + pad)).unwrap_or((0, 0));
     let mut out = RgbaImage::from_pixel(top_w.max(sw), top_h + sh, Rgba([28, 28, 34, 255]));
     let mut x = pad;
-    for panel in [&one, &sil, &zg] {
+    for panel in [&one, &sil, &val, &zg] {
         image::imageops::replace(&mut out, panel, x as i64, pad as i64);
         x += panel.width() + pad;
     }
@@ -339,14 +399,34 @@ pub fn review(img: &RgbaImage, strip: Option<&[RgbaImage]>, zoom: Option<u32>, m
     out
 }
 
-/// Composes a frame onto a canvas enlarged by `m` on each side (to detect clipping).
+/// Composes a frame onto a canvas enlarged by `m` on each side (m = 0: the sprite canvas;
+/// m > 0 shows what would be clipped).
 pub fn compose_margin(s: &Sprite, f: &Frame, m: i32) -> Result<RgbaImage> {
     let mut out = RgbaImage::new(s.width + 2 * m as u32, s.height + 2 * m as u32);
-    for pose in &f.poses {
-        let mut p = pose.clone();
-        p.x += m;
-        p.y += m;
-        blit_pose(&mut out, s.part(&pose.part)?, &p);
+    let poses = s.frame_poses(f)?;
+    let xs = resolve(&poses)?;
+    for (pose, x) in poses.iter().zip(xs) {
+        if pose.hide {
+            continue;
+        }
+        let x = Xform { x: x.x + m as f32, y: x.y + m as f32, ..x };
+        blit(&mut out, s.part(&pose.part)?, &x);
+    }
+    if f.flip_h {
+        out = mirror_h(&out, s.origin[0] + m);
     }
     Ok(out)
+}
+
+/// Grayscale by perceived lightness: the value study that shows whether a sprite reads.
+pub fn value_view(img: &RgbaImage, k: u32) -> RgbaImage {
+    let g = RgbaImage::from_fn(img.width(), img.height(), |x, y| {
+        let p = img.get_pixel(x, y);
+        if p[3] == 0 {
+            return Rgba([255, 255, 255, 255]);
+        }
+        let l = (crate::color::oklab(*p)[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+        Rgba([l, l, l, 255])
+    });
+    upscale(&g, k)
 }

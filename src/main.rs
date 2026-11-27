@@ -5,6 +5,8 @@ mod lint;
 mod model;
 mod render;
 mod tools;
+#[cfg(test)]
+mod tests;
 
 use std::io::{BufRead, Write};
 

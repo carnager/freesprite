@@ -21,9 +21,26 @@ fn list(v: &[(i32, i32)]) -> String {
     s
 }
 
+/// Colors that act as line work: the given outline color, or by default the darkest palette
+/// color plus the tinted outline shades made by `palette_ramp outline` (named "<ramp> outline").
+/// Ordinary dark shading shades are not line work, so cel-shadow corners aren't reported.
+fn line_colors(s: &Sprite, outline: Option<Px>) -> Vec<Px> {
+    if let Some(o) = outline {
+        return vec![o];
+    }
+    let mut v: Vec<Px> = s.palette.darkest().into_iter().collect();
+    for e in &s.palette.0 {
+        if e.ramp.is_some() && e.name.as_deref().is_some_and(|n| n.ends_with(" outline")) && !v.contains(&e.color) {
+            v.push(e.color);
+        }
+    }
+    v
+}
+
 pub fn lint(s: &Sprite, outline: Option<Px>) -> Result<String> {
     let mut out: Vec<String> = vec![];
     let n8 = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+    let lines = line_colors(s, outline);
 
     for (name, part) in &s.parts {
         let img = &part.img;
@@ -52,12 +69,12 @@ pub fn lint(s: &Sprite, outline: Option<Px>) -> Result<String> {
             }
         }
         let floor = (0..h).rev().find(|y| (0..w).any(|x| opaque(img, x, *y).is_some()));
-        if let Some(o) = outline {
-            // in a 2x2 block, 3 outline pixels forming an L -> the elbow pixel is a double
+        if !lines.is_empty() {
+            // in a 2x2 block, 3 line pixels forming an L -> the elbow pixel is a double
             for y in 0..h - 1 {
                 for x in 0..w - 1 {
                     let cells = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)];
-                    let is: Vec<bool> = cells.iter().map(|(cx, cy)| opaque(img, *cx, *cy) == Some(o)).collect();
+                    let is: Vec<bool> = cells.iter().map(|(cx, cy)| opaque(img, *cx, *cy).is_some_and(|p| lines.contains(&p))).collect();
                     // 90° corners where a foot meets the floor line are intentional
                     if Some(y + 1) == floor {
                         continue;
@@ -84,13 +101,53 @@ pub fn lint(s: &Sprite, outline: Option<Px>) -> Result<String> {
         }
     }
 
+    // palette: shared colors make text rows ambiguous; one-color ramps can't shade or sel-out
+    for (i, a) in s.palette.0.iter().enumerate() {
+        if let Some(b) = s.palette.0[i + 1..].iter().find(|b| b.color == a.color) {
+            out.push(format!("palette: keys '{}' and '{}' have the same color (pixels read back as '{}')", a.key, b.key, a.key));
+        }
+    }
+    let mut ramps: std::collections::BTreeMap<&str, usize> = Default::default();
+    for e in &s.palette.0 {
+        if let Some(r) = &e.ramp {
+            *ramps.entry(r).or_default() += 1;
+        }
+    }
+    for (r, n) in ramps.iter().filter(|(_, n)| **n < 2) {
+        out.push(format!("palette: ramp '{r}' has {n} color (shade/ramp/selout need at least 2; palette_ramp builds one)"));
+    }
+
+    if !s.rig.is_empty()
+        && let Err(e) = s.validate_poses(&s.rig, "rig") {
+            out.push(format!("{e:#}"));
+        }
+    if !s.animations.is_empty() {
+        let mut used: std::collections::HashSet<&str> = s.rig.iter().map(|p| p.part.as_str()).collect();
+        for an in s.animations.values() {
+            for f in &an.frames {
+                used.extend(f.poses.iter().map(|p| p.part.as_str()));
+                used.extend(f.keys.iter().filter_map(|k| k.part.as_deref()));
+            }
+        }
+        let unused: Vec<&str> = s.parts.keys().map(String::as_str).filter(|p| !used.contains(p)).collect();
+        if !unused.is_empty() {
+            out.push(format!("parts not used by the rig or any animation: {} (fine if they are spares)", unused.join(", ")));
+        }
+    }
+
     let m = 64;
     let oy = s.origin[1];
     for (an_name, an) in &s.animations {
         let mut feet = vec![];
         let mut centers = vec![];
         for (i, f) in an.frames.iter().enumerate() {
-            let img = render::compose_margin(s, f, m)?;
+            let img = match render::compose_margin(s, f, m) {
+                Ok(img) => img,
+                Err(e) => {
+                    out.push(format!("anim '{an_name}' frame {i}: can't be drawn: {e:#}"));
+                    continue;
+                }
+            };
             let (w, h) = (s.width as i32, s.height as i32);
             let mut clipped = 0;
             let mut bottom: Option<i32> = None;
@@ -108,7 +165,7 @@ pub fn lint(s: &Sprite, outline: Option<Px>) -> Result<String> {
             if clipped > 0 {
                 out.push(format!("anim '{an_name}' frame {i}: {clipped} pixels outside the canvas (clipped)"));
             }
-            if f.poses.is_empty() {
+            if f.poses.is_empty() && !s.is_rig_frame(f) {
                 out.push(format!("anim '{an_name}' frame {i}: empty frame"));
             }
             if let Some(b) = bottom {
@@ -123,12 +180,28 @@ pub fn lint(s: &Sprite, outline: Option<Px>) -> Result<String> {
                 }
             }
         }
-        let bad: Vec<String> = feet.iter().filter(|(_, y)| *y != oy).map(|(i, y)| format!("frame {i}: {:+}", y - oy)).collect();
+        let bad: Vec<(usize, i32)> = feet.iter().filter(|(_, y)| *y != oy).map(|(i, y)| (*i, y - oy)).collect();
         if !bad.is_empty() {
-            out.push(format!(
-                "anim '{an_name}': lowest pixel doesn't touch the origin line y={oy} (- floats, + sinks): {}",
-                bad.join(", ")
-            ));
+            // feet[i].1 is (lowest opaque row + 1): the line the sprite stands on
+            let say = |d: i32| if d > 0 { format!("sink {d}px") } else { format!("float {}px", -d) };
+            let d0 = bad[0].1;
+            if bad.len() == feet.len() && bad.iter().all(|(_, d)| *d == d0) {
+                out.push(format!(
+                    "anim '{an_name}': in every frame the feet {} (lowest row is {}, but origin y={oy} is the line under the feet, so the lowest row should be {}). Fix: sprite_edit origin [{}, {}], or move the root placements (rig roots / root poses) by dy {}",
+                    say(d0),
+                    oy - 1 + d0,
+                    oy - 1,
+                    s.origin[0],
+                    oy + d0,
+                    -d0
+                ));
+            } else {
+                out.push(format!(
+                    "anim '{an_name}': feet off the origin line y={oy} (lowest row should be {}) in {}; fix with pose_set dy on those frames (ignore for jumps)",
+                    oy - 1,
+                    bad.iter().map(|(i, d)| format!("frame {i}: {}", say(*d))).collect::<Vec<_>>().join(", ")
+                ));
+            }
         }
         if centers.len() > 1 && !an_name.contains("walk") {
             let (mn, mx) = centers.iter().fold((f32::MAX, f32::MIN), |(a, b), c| (a.min(*c), b.max(*c)));

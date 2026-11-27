@@ -229,8 +229,11 @@ pub enum PalSpec {
 }
 
 /// Build a palette from specs: "#hex", "k=#hex" or {key,color,name,ramp}. Missing keys are auto-assigned.
+/// (key, color, name, ramp) of one palette spec before keys are assigned
+type SpecItem = (Option<char>, Px, Option<String>, Option<String>);
+
 pub fn palette_from_specs(specs: &[PalSpec]) -> Result<Palette> {
-    let mut items: Vec<(Option<char>, Px, Option<String>, Option<String>)> = vec![];
+    let mut items: Vec<SpecItem> = vec![];
     for s in specs {
         let (k, c, n, r) = match s {
             PalSpec::Hex(h) => match h.split_once('=') {
@@ -382,6 +385,129 @@ pub fn quantize_img(img: &mut image::RgbaImage, pal: &[Px], dither: &str, streng
         d => bail!("unknown dither '{d}' (none, bayer, floyd)"),
     }
     Ok(())
+}
+
+// ---------- OKLab (perceptual lightness / hue for ramps and value checks) ----------
+
+fn srgb_to_lin(c: u8) -> f32 {
+    let c = c as f32 / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+fn lin_to_srgb(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let v = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (v * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// [L, a, b] with L in 0..1.
+#[allow(clippy::excessive_precision)]
+pub fn oklab(p: Px) -> [f32; 3] {
+    let (r, g, b) = (srgb_to_lin(p[0]), srgb_to_lin(p[1]), srgb_to_lin(p[2]));
+    let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+    let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
+    let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+    [
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ]
+}
+
+#[allow(clippy::excessive_precision)]
+pub fn from_oklab(c: [f32; 3]) -> Px {
+    let l = c[0] + 0.3963377774 * c[1] + 0.2158037573 * c[2];
+    let m = c[0] - 0.1055613458 * c[1] - 0.0638541728 * c[2];
+    let s = c[0] - 0.0894841775 * c[1] - 1.2914855480 * c[2];
+    let (l, m, s) = (l * l * l, m * m * m, s * s * s);
+    Rgba([
+        lin_to_srgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+        lin_to_srgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+        lin_to_srgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s),
+        255,
+    ])
+}
+
+/// Perceived lightness 0..1.
+pub fn lightness(p: Px) -> f32 {
+    oklab(p)[0]
+}
+
+/// Hue-shifted shading ramp around `base`, dark to light. Shadows drift toward a cool
+/// violet and gain a little chroma; highlights drift toward warm yellow and lose some, the
+/// classic pixel-art ramp instead of plain darker/lighter copies.
+/// `base_index` is where the base color sits; `step` is the OKLab lightness between shades.
+pub fn hue_ramp(base: Px, steps: usize, base_index: usize, hue_shift_deg: f32, step: f32) -> Vec<Px> {
+    let [l0, a0, b0] = oklab(base);
+    let c0 = (a0 * a0 + b0 * b0).sqrt();
+    let h0 = b0.atan2(a0);
+    let cool = 290f32.to_radians(); // violet-blue
+    let warm = 95f32.to_radians(); // yellow
+    let toward = |h: f32, target: f32, amount: f32| {
+        let mut d = target - h;
+        while d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        }
+        while d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        h + d.signum() * amount.min(d.abs())
+    };
+    (0..steps)
+        .map(|i| {
+            let k = i as f32 - base_index as f32;
+            if k == 0.0 {
+                return base;
+            }
+            let l = (l0 + k * step).clamp(0.08, 0.98);
+            let shift = (hue_shift_deg * k.abs()).to_radians();
+            let (h, c) = if k < 0.0 {
+                (toward(h0, cool, shift), c0 * (1.0 + 0.06 * -k).min(1.3))
+            } else {
+                (toward(h0, warm, shift), c0 * (1.0 - 0.18 * k).max(0.25))
+            };
+            // near-gray bases keep their (tiny) chroma instead of inventing color
+            let c = if c0 < 0.02 { c0 } else { c };
+            from_oklab([l, c * h.cos(), c * h.sin()])
+        })
+        .collect()
+}
+
+/// Deep, cool, desaturated shade of `base` for colored outlines (sel-out): dark enough to
+/// hold the silhouette against any background but still tinted like the material.
+pub fn outline_shade(base: Px) -> Px {
+    let [l0, a0, b0] = oklab(base);
+    let c0 = (a0 * a0 + b0 * b0).sqrt();
+    let h = b0.atan2(a0);
+    let cool = 290f32.to_radians();
+    let mut d = cool - h;
+    while d > std::f32::consts::PI {
+        d -= std::f32::consts::TAU;
+    }
+    while d < -std::f32::consts::PI {
+        d += std::f32::consts::TAU;
+    }
+    let h = h + d.signum() * 30f32.to_radians().min(d.abs());
+    let l = (l0 * 0.42).clamp(0.16, 0.34);
+    let c = (c0 * 0.7).min(0.09);
+    from_oklab([l, c * h.cos(), c * h.sin()])
+}
+
+impl Palette {
+    /// Members of `p`'s ramp, dark to light, and p's index in it.
+    pub fn ramp_of(&self, p: Px) -> Option<(Vec<Px>, usize)> {
+        let r = self.entry_of(p)?.ramp.clone()?;
+        let mut cols: Vec<Px> = self.0.iter().filter(|e| e.ramp.as_deref() == Some(&r)).map(|e| e.color).collect();
+        cols.sort_by(|a, b| lightness(*a).partial_cmp(&lightness(*b)).unwrap());
+        let i = cols.iter().position(|c| *c == p)?;
+        Some((cols, i))
+    }
+    /// Move `p` `steps` shades along its ramp (negative = darker). None if p has no ramp.
+    pub fn ramp_step(&self, p: Px, steps: i32) -> Option<Px> {
+        let (cols, i) = self.ramp_of(p)?;
+        let j = (i as i32 + steps).clamp(0, cols.len() as i32 - 1) as usize;
+        Some(cols[j])
+    }
 }
 
 /// Color pairs (from -> to) for every key present in both palettes with a different color.

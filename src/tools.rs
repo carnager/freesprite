@@ -9,22 +9,30 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::color::{CLEAR, PalSpec, Palette, Px, apply_remap, median_cut, nearest, palette_from_specs, parse_color, quantize_img};
+use crate::color::{
+    CLEAR, PalEntry, PalSpec, Palette, Px, apply_remap, hue_ramp, median_cut, nearest, outline_shade, palette_from_specs, parse_color, parse_hex, quantize_img,
+    to_hex,
+};
 use crate::draw::{self, Op};
 use crate::export;
-use crate::model::{Animation, Frame, Part, Pose, Sprite, check_name};
+use crate::model::{Animation, Frame, Key, Part, Pose, Sprite, check_name};
 use crate::render;
 
-pub const INSTRUCTIONS: &str = "freesprite is a parts-based pixel-art sprite editor for adventure-game characters.\n\
-Concepts: a sprite has a fixed canvas (width x height), an origin (the feet point used for placement in the game), a palette, \
-parts (small reusable pixel images such as head/torso/arm_l, each with a pivot point), and animations. \
-An animation is a list of frames; a frame is a list of poses, each placing a part's pivot at x,y on the canvas with optional rotation (degrees clockwise) and flips. \
-Pose order = draw order (first is furthest back).\n\
-Workflow: sprite_new -> palette_set with semantic keys (o=outline, a/A/1 skin shadow/base/highlight...) or palette_from_image to match a background -> \
-part_new + draw (block in silhouettes with polygon/ellipse, then refine with the 'rows' op written in palette keys) or part_import/part_extract from an image -> \
-anim_set -> review (silhouette + zoom grid + frame strip) and lint, fix, repeat -> export for Godot.\n\
-Tips: draw each part once and animate by moving/rotating parts instead of redrawing frames; create variant parts (mouth_open, arm_l_bent) for shape changes; \
-anim_copy with mirror=true turns walk_right into walk_left; use part_get to read exact pixels before editing; every change autosaves; undo/redo exist.";
+pub const INSTRUCTIONS: &str = "freesprite is a parts-based pixel-art sprite editor for point-and-click adventure characters (Day of the Tentacle style: \
+big expressive heads, rubbery cartoon shapes, cel shading, lip-synced talk).\n\
+Concepts: a sprite has a fixed canvas, an origin (the line under the feet, used for placement in the game), a palette of one-char keys grouped into ramps, \
+parts (reusable pixel images with a pivot: head, torso, arm_l, mouth_a...) and animations made of frames.\n\
+Rig: rig_set defines the rest pose. Every slot places a part, and children (mouth, eyes, hat on the head; head and arms on the torso) hang from their parent's pivot. \
+Frames without poses are drawn from the rig plus their keys ({slot, dx, dy, rot, part swap, hide}), so moving the torso moves everything attached to it \
+and an animation only lists what changes. Explicit frames (a full poses list) still work.\n\
+Workflow: sprite_new -> palette_ramp for each material (skin, hair, clothes; hue-shifted shading) plus an outline key -> \
+part_new + draw: block in with curve (closed+fill) / ellipse / polygon, mirror for symmetry, shade for cel shading from the light, \
+contour for inner lines, outline (selout) last, then refine single pixels with rows -> rig_set -> anim_generate (idle, walk) and anim_talk (lip-sync from text) \
+-> pose_set to refine -> review (silhouette, value study, zoom, strip) and lint after every step -> export for Godot.\n\
+DOTT tips: heads about a third of the body height, and readable faces with big eyes and nose. Keep one light direction for every part (shade light default top-left). \
+Check the value panel so face and hands separate from clothes. Draw variant parts (arm_bent, head_turned, mouth_*) instead of rotating small detailed parts, \
+because rotation suits limbs and noise shows up on small striped shapes. Use anim_copy mirror=true for the other walk direction, and part_get to read exact pixels before patching. \
+Every change autosaves; undo/redo exist.";
 
 pub enum Out {
     Text(String),
@@ -48,11 +56,10 @@ fn parse<T: DeserializeOwned>(v: Value) -> Result<T> {
 }
 
 pub fn expand(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(h) = std::env::var_os("HOME") {
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(h) = std::env::var_os("HOME") {
             return PathBuf::from(h).join(rest);
         }
-    }
     PathBuf::from(p)
 }
 
@@ -73,10 +80,47 @@ fn opt_color(s: &Option<String>, pal: &Palette) -> Result<Option<Px>> {
 
 fn part_preview(s: &Sprite, name: &str) -> Result<Out> {
     let p = s.part(name)?;
-    let k = render::auto_scale(p.img.width(), p.img.height(), 1, 1).min(16).max(4);
+    let k = render::auto_scale(p.img.width(), p.img.height(), 1, 1).clamp(4, 16);
     let mut img = render::present(&p.img, k, None);
     render::marker(&mut img, p.pivot[0], p.pivot[1], k, Rgba([255, 0, 200, 255]));
     Ok(Out::Image(img))
+}
+
+/// One frame, scaled up, with the origin (magenta) and every placement's pivot (cyan).
+fn pose_sheet(s: &Sprite, f: &Frame) -> Result<Out> {
+    let img = render::compose(s, f)?;
+    let k = render::auto_scale(s.width, s.height, 1, 1).min(8);
+    let mut out = render::present(&img, k, None);
+    render::marker(&mut out, s.origin[0] as f32, s.origin[1] as f32, k, Rgba([255, 0, 200, 255]));
+    for (_, x) in render::frame_xforms(s, f)? {
+        render::marker(&mut out, x.x, x.y, k, Rgba([0, 200, 255, 255]));
+    }
+    Ok(Out::Image(out))
+}
+
+/// The first `max` frames of an animation side by side.
+fn anim_strip(s: &Sprite, anim: &str, max: usize) -> Result<Out> {
+    let frames = s.anim(anim)?.frames.iter().take(max).map(|f| render::compose(s, f)).collect::<Result<Vec<_>>>()?;
+    let k = render::auto_scale(s.width, s.height, frames.len() as u32, 1).min(4);
+    Ok(Out::Image(render::grid(&[frames], k, None)))
+}
+
+/// Close-up strip around one rig slot (e.g. the mouth), so small changes are visible.
+fn slot_strip(s: &Sprite, anim: &str, slot: &str, max: usize) -> Result<Out> {
+    let rest = Frame::rig(100, vec![]);
+    let (_, x) = render::frame_xforms(s, &rest)?.into_iter().find(|(p, _)| p.slot() == slot).ok_or_else(|| anyhow!("no slot '{slot}'"))?;
+    let (w, h) = (24u32.min(s.width), 20u32.min(s.height));
+    let cx = (x.x as i64 - w as i64 / 2).clamp(0, (s.width - w) as i64) as u32;
+    let cy = (x.y as i64 - h as i64 / 2).clamp(0, (s.height - h) as i64) as u32;
+    let frames = s
+        .anim(anim)?
+        .frames
+        .iter()
+        .take(max)
+        .map(|f| render::compose(s, f).map(|img| image::imageops::crop_imm(&img, cx, cy, w, h).to_image()))
+        .collect::<Result<Vec<_>>>()?;
+    let rows: Vec<Vec<RgbaImage>> = frames.chunks(12).map(|c| c.to_vec()).collect();
+    Ok(Out::Image(render::grid(&rows, 5, None)))
 }
 
 fn quantize_to(img: &mut RgbaImage, pal: &[Px]) -> Result<()> {
@@ -294,7 +338,9 @@ struct PoseSet {
     anim: String,
     #[serde(default)]
     frames: Vec<usize>,
-    part: String,
+    /// explicit frames: the part to change; rig frames: the slot (same as `slot`)
+    part: Option<String>,
+    slot: Option<String>,
     x: Option<i32>,
     y: Option<i32>,
     #[serde(default)]
@@ -392,6 +438,60 @@ struct Pixelate {
 struct SpriteRef {
     sprite: String,
 }
+#[derive(Deserialize)]
+struct RigSet {
+    sprite: String,
+    poses: Vec<Pose>,
+}
+#[derive(Deserialize)]
+struct PaletteRamp {
+    sprite: String,
+    name: String,
+    base: String,
+    keys: String,
+    base_index: Option<usize>,
+    hue_shift: Option<f32>,
+    step: Option<f32>,
+    /// extra key for a deep colored outline shade in the same ramp (what selout picks)
+    outline: Option<String>,
+}
+#[derive(Deserialize)]
+struct AnimTalk {
+    sprite: String,
+    text: String,
+    anim: Option<String>,
+    slot: Option<String>,
+    #[serde(default)]
+    visemes: HashMap<String, String>,
+    ms: Option<u32>,
+    head: Option<String>,
+    #[serde(rename = "loop", default)]
+    looped: bool,
+}
+#[derive(Deserialize)]
+struct Blink {
+    slot: String,
+    /// swap to this part (eyes -> eyes_closed); without it the slot is shown (lids hidden in the rig)
+    part: Option<String>,
+}
+#[derive(Deserialize)]
+struct AnimGenerate {
+    sprite: String,
+    preset: String,
+    anim: Option<String>,
+    ms: Option<u32>,
+    frames: Option<usize>,
+    // idle
+    body: Option<Vec<String>>,
+    #[serde(default)]
+    lag: Vec<String>,
+    blink: Option<Blink>,
+    // walk
+    legs: Option<[String; 2]>,
+    arms: Option<[String; 2]>,
+    swing: Option<f32>,
+    arm_swing: Option<f32>,
+}
 
 impl Workspace {
     pub fn call(&mut self, name: &str, args: Value) -> Value {
@@ -423,8 +523,21 @@ impl Workspace {
         if !self.docs.contains_key(name) {
             let dir = expand(name);
             if dir.join("sprite.json").exists() {
+                // already open under its name? reuse it (keeps the undo history)
+                if let Ok(canon) = std::fs::canonicalize(&dir) {
+                    let hit = self.docs.iter().find(|(_, d)| std::fs::canonicalize(&d.dir).is_ok_and(|c| c == canon)).map(|(k, _)| k.clone());
+                    if let Some(k) = hit {
+                        return Ok(self.docs.get_mut(&k).unwrap());
+                    }
+                }
                 let sprite = Sprite::load(&dir)?;
                 let n = sprite.name.clone();
+                if let Some(other) = self.docs.get(&n) {
+                    bail!(
+                        "a different sprite named '{n}' is already open from {}; give one of them another name (sprite_open replaces it explicitly)",
+                        other.dir.display()
+                    );
+                }
                 self.docs.insert(n.clone(), Doc { sprite, dir, undo: vec![], redo: vec![] });
                 return Ok(self.docs.get_mut(&n).unwrap());
             }
@@ -439,9 +552,19 @@ impl Workspace {
     fn mutate(&mut self, name: &str, f: impl FnOnce(&mut Sprite) -> Result<Vec<Out>>) -> Result<Vec<Out>> {
         let doc = self.doc(name)?;
         let backup = doc.sprite.clone();
-        match f(&mut doc.sprite) {
+        // a panic inside f must not leave a half-applied change in memory
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut doc.sprite))).unwrap_or_else(|p| {
+            let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            Err(anyhow!("internal error: {msg}"))
+        });
+        match res {
             Ok(o) => {
-                doc.sprite.save(&doc.dir)?;
+                if let Err(e) = doc.sprite.save(&doc.dir) {
+                    doc.sprite = backup;
+                    // put the files back in line with the restored sprite (best effort)
+                    let _ = doc.sprite.save(&doc.dir);
+                    return Err(e.context("saving failed; the change was rolled back"));
+                }
                 doc.undo.push(backup);
                 if doc.undo.len() > 200 {
                     doc.undo.remove(0);
@@ -473,12 +596,35 @@ impl Workspace {
         for (n, p) in &s.parts {
             t += &format!("  {n}: {}x{} pivot {:?}\n", p.img.width(), p.img.height(), p.pivot);
         }
+        if !s.rig.is_empty() {
+            t += "rig (rest pose, back to front):\n";
+            for p in &s.rig {
+                t += &format!("  {}\n", serde_json::to_string(p).unwrap_or_default());
+            }
+        }
         t += "animations:\n";
         for (n, a) in &s.animations {
             let d: Vec<String> = a.frames.iter().map(|f| f.duration_ms.to_string()).collect();
-            t += &format!("  {n}: {} frames, loop={}, durations ms [{}]\n", a.frames.len(), a.looped, d.join(","));
+            let rig = a.frames.iter().filter(|f| s.is_rig_frame(f)).count();
+            t += &format!(
+                "  {n}: {} frames{}, loop={}, durations ms [{}]\n",
+                a.frames.len(),
+                if rig > 0 { format!(" ({rig} rig frames)") } else { String::new() },
+                a.looped,
+                d.join(",")
+            );
         }
         t
+    }
+
+    /// Re-validates every animation against the current parts and rig.
+    fn check_anims(s: &Sprite) -> Result<()> {
+        for (n, a) in &s.animations {
+            for (i, f) in a.frames.iter().enumerate() {
+                s.validate_frame(f).map_err(|e| anyhow!("animation '{n}' frame {i}: {e:#}"))?;
+            }
+        }
+        Ok(())
     }
 
     fn dispatch(&mut self, name: &str, args: Value) -> Result<Vec<Out>> {
@@ -503,6 +649,7 @@ impl Workspace {
                     portrait: None,
                     palette_variants: Default::default(),
                     parts: Default::default(),
+                    rig: vec![],
                     animations: Default::default(),
                 };
                 sprite.save(&dir)?;
@@ -539,17 +686,30 @@ impl Workspace {
                     s.width = w;
                     s.height = h;
                     let [ox, oy] = a.offset;
+                    if ox.unsigned_abs() > 4096 || oy.unsigned_abs() > 4096 {
+                        bail!("offset out of range");
+                    }
                     if ox != 0 || oy != 0 {
                         s.origin[0] += ox;
                         s.origin[1] += oy;
+                        // only roots: children are offsets from their parent and move with it
+                        let shift = |p: &mut Pose| {
+                            if p.parent.is_none() {
+                                p.x += ox;
+                                p.y += oy;
+                            }
+                        };
+                        s.rig.iter_mut().for_each(shift);
                         for an in s.animations.values_mut() {
                             for f in &mut an.frames {
-                                for p in &mut f.poses {
-                                    p.x += ox;
-                                    p.y += oy;
-                                }
+                                f.poses.iter_mut().for_each(shift);
                             }
                         }
+                    }
+                    if let Some(o) = a.origin
+                        && (o[0].unsigned_abs() > 8192 || o[1].unsigned_abs() > 8192)
+                    {
+                        bail!("origin out of range");
                     }
                     Ok(vec![Out::Text(format!("canvas {}x{}, origin {:?}", s.width, s.height, s.origin))])
                 })
@@ -562,11 +722,10 @@ impl Workspace {
                     // palette swap: pixels whose key survives get the new color
                     let mut remap = vec![];
                     for e in &old.0 {
-                        if let Some(n) = s.palette.by_key(e.key) {
-                            if n != e.color {
+                        if let Some(n) = s.palette.by_key(e.key)
+                            && n != e.color {
                                 remap.push((e.color, n));
                             }
-                        }
                     }
                     let mut changed = 0;
                     if !remap.is_empty() {
@@ -670,11 +829,22 @@ impl Workspace {
                         }
                         let p = s.parts.remove(&a.part).ok_or_else(|| anyhow!("no part '{}'", a.part))?;
                         s.parts.insert(new.clone(), p);
+                        // the slot name stays the old part name so parents and keys keep working
+                        let rename = |p: &mut Pose| {
+                            if p.part == a.part {
+                                if p.slot.is_none() {
+                                    p.slot = Some(a.part.clone());
+                                }
+                                p.part = new.clone();
+                            }
+                        };
+                        s.rig.iter_mut().for_each(rename);
                         for an in s.animations.values_mut() {
                             for f in &mut an.frames {
-                                for p in &mut f.poses {
-                                    if p.part == a.part {
-                                        p.part = new.clone();
+                                f.poses.iter_mut().for_each(rename);
+                                for k in &mut f.keys {
+                                    if k.part.as_deref() == Some(a.part.as_str()) {
+                                        k.part = Some(new.clone());
                                     }
                                 }
                             }
@@ -703,14 +873,19 @@ impl Workspace {
                 let a: PartRef = parse(args)?;
                 self.mutate(&a.sprite, |s| {
                     s.part(&a.part)?;
-                    let used: Vec<String> = s
+                    let mut used: Vec<String> = s
                         .animations
                         .iter()
-                        .filter(|(_, an)| an.frames.iter().any(|f| f.poses.iter().any(|p| p.part == a.part)))
-                        .map(|(n, _)| n.clone())
+                        .filter(|(_, an)| {
+                            an.frames.iter().any(|f| f.poses.iter().any(|p| p.part == a.part) || f.keys.iter().any(|k| k.part.as_deref() == Some(a.part.as_str())))
+                        })
+                        .map(|(n, _)| format!("animation '{n}'"))
                         .collect();
+                    if s.rig.iter().any(|p| p.part == a.part) {
+                        used.insert(0, "the rig".into());
+                    }
                     if !used.is_empty() {
-                        bail!("part '{}' is used by animations: {}", a.part, used.join(", "));
+                        bail!("part '{}' is used by {}", a.part, used.join(", "));
                     }
                     s.parts.remove(&a.part);
                     Ok(vec![Out::Text(format!("deleted part '{}'", a.part))])
@@ -820,10 +995,20 @@ impl Workspace {
                 self.mutate(&a.sprite, |s| {
                     let pal = s.palette.clone();
                     let p = s.part_mut(&a.part)?;
+                    let off_palette = |img: &RgbaImage| if pal.is_empty() { 0 } else { img.pixels().filter(|px| px[3] > 0 && pal.entry_of(**px).is_none()).count() };
+                    let before = off_palette(&p.img);
                     for (i, op) in a.ops.iter().enumerate() {
                         draw::apply(&mut p.img, op, &pal).map_err(|e| anyhow!("op {i}: {e}"))?;
                     }
-                    let mut out = vec![Out::Text(format!("applied {} ops to '{}'", a.ops.len(), a.part))];
+                    let after = off_palette(&p.img);
+                    let mut msg = format!("applied {} ops to '{}'", a.ops.len(), a.part);
+                    if after > before {
+                        msg += &format!(
+                            "\nwarning: {} new off-palette pixels (a #hex color or legend that isn't a palette key); add it to the palette or use a key",
+                            after - before
+                        );
+                    }
+                    let mut out = vec![Out::Text(msg)];
                     if a.preview {
                         out.push(part_preview(s, &a.part)?);
                     }
@@ -915,7 +1100,7 @@ impl Workspace {
                 let s = &d.sprite;
                 let outline = match &a.outline {
                     Some(c) => Some(parse_color(c, &s.palette)?),
-                    None => s.palette.darkest(),
+                    None => None,
                 };
                 Ok(vec![Out::Text(crate::lint::lint(s, outline)?)])
             }
@@ -932,10 +1117,19 @@ impl Workspace {
             }
             "pose_set" => {
                 let a: PoseSet = parse(args)?;
+                let target = a.slot.clone().or(a.part.clone()).ok_or_else(|| anyhow!("pass part (explicit frames) or slot (rig frames)"))?;
+                let lim = crate::model::MAX_POS as i32;
+                if [a.x.unwrap_or(0), a.y.unwrap_or(0), a.dx, a.dy].iter().any(|v| v.unsigned_abs() > lim as u32) || a.rot.is_some_and(|r| !r.is_finite()) {
+                    bail!("x/y/dx/dy must be within ±{lim} and rot finite");
+                }
                 self.mutate(&a.sprite, |s| {
-                    s.part(&a.part)?;
                     if let Some(r) = &a.replace_with {
                         s.part(r)?;
+                    }
+                    let rig = s.rig.clone();
+                    let rig_frame: Vec<bool> = s.anim(&a.anim)?.frames.iter().map(|f| s.is_rig_frame(f)).collect();
+                    if rig_frame.contains(&false) && a.slot.is_none() {
+                        s.part(&target)?;
                     }
                     let an = s.anim_mut(&a.anim)?;
                     let idx: Vec<usize> = if a.frames.is_empty() { (0..an.frames.len()).collect() } else { a.frames.clone() };
@@ -943,9 +1137,58 @@ impl Workspace {
                     for i in idx {
                         let len = an.frames.len();
                         let f = an.frames.get_mut(i).ok_or_else(|| anyhow!("frame {i} out of range ({len} frames)"))?;
-                        let pos = f.poses.iter().position(|p| p.part == a.part);
+                        if rig_frame[i] {
+                            // rig frame: edit the slot's key (offsets/rotation relative to the rest pose)
+                            let rest = rig.iter().find(|p| p.slot() == target).ok_or_else(|| {
+                                anyhow!("no rig slot '{target}' (slots: {})", rig.iter().map(|p| p.slot().to_string()).collect::<Vec<_>>().join(", "))
+                            })?;
+                            let ki = match f.keys.iter().position(|k| k.slot == target) {
+                                Some(ki) => ki,
+                                None => {
+                                    f.keys.push(Key { slot: target.clone(), ..Default::default() });
+                                    f.keys.len() - 1
+                                }
+                            };
+                            let k = &mut f.keys[ki];
+                            if a.remove {
+                                k.hide = Some(true);
+                            }
+                            if let Some(v) = a.x {
+                                k.dx = v - rest.x;
+                            }
+                            if let Some(v) = a.y {
+                                k.dy = v - rest.y;
+                            }
+                            k.dx += a.dx;
+                            k.dy += a.dy;
+                            if let Some(v) = a.rot {
+                                k.rot = v - rest.rot;
+                            }
+                            if a.flip_h.is_some() {
+                                k.flip_h = a.flip_h;
+                            }
+                            if a.flip_v.is_some() {
+                                k.flip_v = a.flip_v;
+                            }
+                            if let Some(r) = &a.replace_with {
+                                k.part = (r != &rest.part).then(|| r.clone());
+                            }
+                            if a.z.is_some() {
+                                k.z = a.z;
+                            }
+                            if k.is_noop() {
+                                f.keys.remove(ki);
+                            }
+                            changed += 1;
+                            continue;
+                        }
+                        let pos = f.poses.iter().position(|p| p.part == target || p.slot.as_deref() == Some(target.as_str()));
                         if a.remove {
                             if let Some(pi) = pos {
+                                if f.poses.len() == 1 && !rig.is_empty() {
+                                    // an empty explicit frame would silently turn into a rig frame
+                                    bail!("removing '{target}' would leave frame {i} without poses, which draws the rig; delete the frame (frame_delete) or hide the part instead");
+                                }
                                 f.poses.remove(pi);
                                 changed += 1;
                             }
@@ -954,7 +1197,7 @@ impl Workspace {
                         let pi = match pos {
                             Some(pi) => pi,
                             None => {
-                                f.poses.push(Pose { part: a.part.clone(), x: 0, y: 0, rot: 0.0, flip_h: false, flip_v: false });
+                                f.poses.push(Pose { part: target.clone(), ..Default::default() });
                                 f.poses.len() - 1
                             }
                         };
@@ -986,7 +1229,8 @@ impl Workspace {
                         }
                         changed += 1;
                     }
-                    Ok(vec![Out::Text(format!("updated '{}' in {changed} frame(s) of '{}'", a.part, a.anim))])
+                    Self::check_anims(s)?;
+                    Ok(vec![Out::Text(format!("updated '{target}' in {changed} frame(s) of '{}'", a.anim))])
                 })
             }
             "anim_delete" => {
@@ -1003,13 +1247,9 @@ impl Workspace {
                 self.mutate(&a.sprite, |s| {
                     let mut an = s.anim(&a.from)?.clone();
                     if a.mirror {
-                        let w = s.width as i32;
+                        // mirror the composed frame around the origin, so the feet stay put
                         for f in &mut an.frames {
-                            for p in &mut f.poses {
-                                p.x = w - p.x;
-                                p.flip_h = !p.flip_h;
-                                p.rot = -p.rot;
-                            }
+                            f.flip_h = !f.flip_h;
                         }
                     }
                     if a.reverse {
@@ -1067,8 +1307,9 @@ impl Workspace {
                         let mut out = render::present(&img, k, bg);
                         if a.markers {
                             render::marker(&mut out, s.origin[0] as f32, s.origin[1] as f32, k, mark);
-                            for pose in &f.poses {
-                                render::marker(&mut out, pose.x as f32, pose.y as f32, k, Rgba([0, 200, 255, 255]));
+                            for (_, x) in render::frame_xforms(s, f)? {
+                                let px = if f.flip_h { 2.0 * s.origin[0] as f32 - x.x } else { x.x };
+                                render::marker(&mut out, px, x.y, k, Rgba([0, 200, 255, 255]));
                             }
                         }
                         Ok(vec![
@@ -1182,6 +1423,396 @@ impl Workspace {
                     Out::Image(render::upscale(&img, k)),
                 ])
             }
+            "rig_set" => {
+                let a: RigSet = parse(args)?;
+                self.mutate(&a.sprite, |s| {
+                    s.validate_poses(&a.poses, "rig")?;
+                    let mut warn = String::new();
+                    if s.rig.is_empty() {
+                        let blank: Vec<String> = s
+                            .animations
+                            .iter()
+                            .flat_map(|(n, an)| an.frames.iter().enumerate().filter(|(_, f)| f.poses.is_empty()).map(move |(i, _)| format!("{n}[{i}]")))
+                            .collect();
+                        if !blank.is_empty() {
+                            warn = format!("\nnote: frames without poses now draw the rig: {}", blank.join(", "));
+                        }
+                    }
+                    s.rig = a.poses.clone();
+                    Self::check_anims(s)?;
+                    let f = Frame::rig(100, vec![]);
+                    let mut tree = String::new();
+                    fn walk(s: &Sprite, parent: Option<&str>, depth: usize, out: &mut String) {
+                        for p in s.rig.iter().filter(|p| p.parent.as_deref() == parent) {
+                            *out += &format!(
+                                "{}{} ({}{}) at {},{}{}\n",
+                                "  ".repeat(depth + 1),
+                                p.slot(),
+                                p.part,
+                                if p.hide { ", hidden" } else { "" },
+                                p.x,
+                                p.y,
+                                if p.rot != 0.0 { format!(" rot {}", p.rot) } else { String::new() }
+                            );
+                            walk(s, Some(p.slot()), depth + 1, out);
+                        }
+                    }
+                    walk(s, None, 0, &mut tree);
+                    Ok(vec![
+                        Out::Text(format!(
+                            "rig set: {} slots (x,y of children are offsets from the parent's pivot)\n{tree}frames without poses are drawn from this rest pose plus their keys{warn}",
+                            s.rig.len()
+                        )),
+                        pose_sheet(s, &f)?,
+                    ])
+                })
+            }
+            "palette_ramp" => {
+                let a: PaletteRamp = parse(args)?;
+                check_name("ramp", &a.name)?;
+                let keys: Vec<char> = a.keys.chars().collect();
+                if keys.len() < 2 || keys.len() > 12 {
+                    bail!("keys: 2 to 12 characters, one per shade, dark to light");
+                }
+                let bi = a.base_index.unwrap_or(keys.len() / 2);
+                if bi >= keys.len() {
+                    bail!("base_index {bi} out of range (0..{})", keys.len());
+                }
+                let base = parse_hex(&a.base)?;
+                let mut cols = hue_ramp(base, keys.len(), bi, a.hue_shift.unwrap_or(12.0), a.step.unwrap_or(0.1).clamp(0.02, 0.3));
+                let mut keys = keys;
+                if let Some(o) = &a.outline {
+                    let mut ch = o.chars();
+                    let (Some(k), None) = (ch.next(), ch.next()) else { bail!("outline must be one key character") };
+                    if keys.contains(&k) {
+                        bail!("outline key '{k}' is also a shade key");
+                    }
+                    let oc = outline_shade(base);
+                    if crate::color::lightness(oc) >= crate::color::lightness(cols[0]) {
+                        bail!("the ramp's darkest shade is already darker than an outline would be; skip outline and use the darkest key");
+                    }
+                    keys.insert(0, k);
+                    cols.insert(0, oc);
+                }
+                self.mutate(&a.sprite, |s| {
+                    let mut recolored = 0;
+                    for (i, (k, c)) in keys.iter().zip(&cols).enumerate() {
+                        if let Some(other) = s.palette.0.iter().find(|e| e.color == *c && e.key != *k) {
+                            bail!("shade {i} ({}) equals the color of key '{}'; change step or hue_shift", to_hex(*c), other.key);
+                        }
+                        let label = Some(match (a.outline.is_some(), i) {
+                            (true, 0) => format!("{} outline", a.name),
+                            (true, i) => format!("{} {}", a.name, i - 1),
+                            (false, i) => format!("{} {i}", a.name),
+                        });
+                        match s.palette.0.iter_mut().find(|e| e.key == *k) {
+                            Some(e) => {
+                                if e.color != *c {
+                                    let old = e.color;
+                                    for p in s.parts.values_mut() {
+                                        for px in p.img.pixels_mut().filter(|px| **px == old) {
+                                            *px = *c;
+                                            recolored += 1;
+                                        }
+                                    }
+                                }
+                                e.color = *c;
+                                e.ramp = Some(a.name.clone());
+                                e.name = label;
+                            }
+                            None => s.palette.0.push(PalEntry { key: *k, color: *c, name: label, ramp: Some(a.name.clone()) }),
+                        }
+                    }
+                    // keys left over from an earlier, longer version of this ramp leave it
+                    let mut dropped = vec![];
+                    for e in s.palette.0.iter_mut().filter(|e| e.ramp.as_deref() == Some(a.name.as_str()) && !keys.contains(&e.key)) {
+                        e.ramp = None;
+                        dropped.push(e.key.to_string());
+                    }
+                    s.palette.validate()?;
+                    let swatch = RgbaImage::from_fn(cols.len() as u32, 1, |x, _| cols[x as usize]);
+                    Ok(vec![
+                        Out::Text(format!(
+                            "ramp '{}' (dark -> light): {}{}{}",
+                            a.name,
+                            keys.iter().zip(&cols).map(|(k, c)| format!("{k}={}", to_hex(*c))).collect::<Vec<_>>().join(" "),
+                            if recolored > 0 { format!("\nrecolored {recolored} pixels") } else { String::new() },
+                            if dropped.is_empty() { String::new() } else { format!("\nkeys {} are no longer part of ramp '{}'", dropped.join(", "), a.name) }
+                        )),
+                        Out::Image(render::upscale(&swatch, 32)),
+                    ])
+                })
+            }
+            "anim_talk" => {
+                let a: AnimTalk = parse(args)?;
+                let name = a.anim.clone().unwrap_or_else(|| "talk".into());
+                check_name("animation", &name)?;
+                let slot = a.slot.clone().unwrap_or_else(|| "mouth".into());
+                let ms = a.ms.unwrap_or(75).clamp(30, 1000);
+                self.mutate(&a.sprite, |s| {
+                    if s.rig.is_empty() {
+                        bail!("anim_talk works on a rig: set one with rig_set (with a '{slot}' slot)");
+                    }
+                    let rest = s.rig.iter().find(|p| p.slot() == slot).cloned().ok_or_else(|| {
+                        anyhow!("no rig slot '{slot}' (slots: {}); pass slot", s.rig.iter().map(|p| p.slot().to_string()).collect::<Vec<_>>().join(", "))
+                    })?;
+                    if let Some(h) = &a.head
+                        && !s.rig.iter().any(|p| p.slot() == h) {
+                            bail!("no rig slot '{h}' for head");
+                        }
+                    for p in a.visemes.values() {
+                        s.part(p)?;
+                    }
+                    let prefixes: Vec<String> = {
+                        let mut v = vec![slot.clone()];
+                        if let Some((pre, _)) = rest.part.rsplit_once('_') {
+                            v.push(pre.to_string());
+                        }
+                        v
+                    };
+                    let find = |class: &str| -> Option<String> {
+                        if let Some((_, p)) = a.visemes.iter().find(|(k, _)| k.eq_ignore_ascii_case(class)) {
+                            return Some(p.clone());
+                        }
+                        prefixes.iter().map(|pre| format!("{pre}_{}", class.to_lowercase())).find(|n| s.parts.contains_key(n))
+                    };
+                    let rest_part = find("rest").unwrap_or_else(|| rest.part.clone());
+                    let chains: [(&str, &[&str]); 7] = [
+                        ("A", &["A", "O", "E", "C"]),
+                        ("E", &["E", "C", "A"]),
+                        ("O", &["O", "A", "E"]),
+                        ("M", &["M"]),
+                        ("F", &["F", "E", "M"]),
+                        ("L", &["L", "C", "E"]),
+                        ("C", &["C", "E", "A"]),
+                    ];
+                    let mut map: HashMap<&str, String> = HashMap::new();
+                    for (class, chain) in chains {
+                        if let Some(p) = chain.iter().find_map(|c| find(c)) {
+                            map.insert(class, p);
+                        }
+                    }
+                    map.entry("M").or_insert_with(|| rest_part.clone());
+                    if !["A", "E", "O"].iter().any(|c| map.contains_key(c)) {
+                        bail!(
+                            "no open mouth parts found: name them {0}_a, {0}_e, {0}_o (and optionally {0}_m, {0}_f, {0}_l, {0}_c, {0}_rest) or pass visemes {{\"A\": part, ...}}",
+                            prefixes[prefixes.len() - 1]
+                        );
+                    }
+                    let mut seq: Vec<(&str, u32)> = vec![];
+                    for ch in a.text.chars() {
+                        let (class, d) = match ch.to_lowercase().next().unwrap_or(ch) {
+                            'a' => ("A", ms),
+                            'e' | 'i' | 'y' | 'ä' => ("E", ms),
+                            'o' | 'u' | 'w' | 'q' | 'ö' | 'ü' => ("O", ms),
+                            'm' | 'b' | 'p' => ("M", ms),
+                            'f' | 'v' => ("F", ms),
+                            'l' | 't' | 'd' | 'n' | 'r' => ("L", ms),
+                            ',' | ';' | ':' | '-' | '–' | '—' => ("rest", ms * 3),
+                            '.' | '!' | '?' | '…' => ("rest", ms * 5),
+                            c if c.is_whitespace() => ("rest", ms),
+                            c if c.is_alphanumeric() => ("C", ms),
+                            _ => continue,
+                        };
+                        match seq.last_mut() {
+                            Some((c, dur)) if *c == class => *dur += d,
+                            _ => seq.push((class, d)),
+                        }
+                    }
+                    while seq.first().is_some_and(|(c, _)| *c == "rest") {
+                        seq.remove(0);
+                    }
+                    match seq.last_mut() {
+                        Some((c, d)) if *c == "rest" => *d = (*d).max(250),
+                        _ => seq.push(("rest", 250)),
+                    }
+                    if seq.len() > 2000 {
+                        bail!("text too long ({} mouth changes); split it into several lines", seq.len());
+                    }
+                    let frames: Vec<Frame> = seq
+                        .iter()
+                        .map(|(class, d)| {
+                            let part = if *class == "rest" { rest_part.clone() } else { map.get(class).cloned().unwrap_or_else(|| rest_part.clone()) };
+                            let mut keys = vec![];
+                            if part != rest.part {
+                                keys.push(Key { slot: slot.clone(), part: Some(part), ..Default::default() });
+                            }
+                            if let Some(h) = &a.head
+                                && matches!(*class, "A" | "O") {
+                                    keys.push(Key { slot: h.clone(), dy: -1, ..Default::default() });
+                                }
+                            Frame::rig(*d, keys)
+                        })
+                        .collect();
+                    let total: u32 = frames.iter().map(|f| f.duration_ms).sum();
+                    let visemes = seq.iter().map(|(c, _)| if *c == "rest" { "_" } else { c }).collect::<Vec<_>>().join("");
+                    let used: Vec<String> = {
+                        let mut v: Vec<String> = map.iter().map(|(k, p)| format!("{k}={p}")).collect();
+                        v.sort();
+                        v
+                    };
+                    let n = frames.len();
+                    s.animations.insert(name.clone(), Animation { looped: a.looped, frames });
+                    Self::check_anims(s)?;
+                    Ok(vec![
+                        Out::Text(format!(
+                            "'{name}': {n} frames, {total} ms, visemes {visemes} ('_' = rest {rest_part})\nmouths: {}\nimage: close-up of the first frames, 12 per row\ntweak with pose_set (slot '{slot}'), or retime with frame durations",
+                            used.join(", ")
+                        )),
+                        slot_strip(s, &name, &slot, 36)?,
+                    ])
+                })
+            }
+            "anim_generate" => {
+                let a: AnimGenerate = parse(args)?;
+                self.mutate(&a.sprite, |s| {
+                    if s.rig.is_empty() {
+                        bail!("anim_generate works on a rig: set one with rig_set first");
+                    }
+                    let slots: Vec<String> = s.rig.iter().map(|p| p.slot().to_string()).collect();
+                    let need = |sl: &str| -> Result<()> {
+                        if slots.iter().any(|x| x == sl) { Ok(()) } else { bail!("no rig slot '{sl}' (slots: {})", slots.join(", ")) }
+                    };
+                    let descends = |child: &str, anc: &str| -> bool {
+                        let mut cur = s.rig.iter().find(|p| p.slot() == child);
+                        let mut guard = 0;
+                        while let Some(p) = cur {
+                            match &p.parent {
+                                Some(par) if par == anc => return true,
+                                Some(par) => cur = s.rig.iter().find(|q| q.slot() == par),
+                                None => return false,
+                            }
+                            guard += 1;
+                            if guard > slots.len() {
+                                return false;
+                            }
+                        }
+                        false
+                    };
+                    let (name, frames, note) = match a.preset.as_str() {
+                        "idle" => {
+                            let name = a.anim.clone().unwrap_or_else(|| "idle".into());
+                            let ms = a.ms.unwrap_or(180).clamp(40, 2000);
+                            let body = match &a.body {
+                                Some(b) => b.clone(),
+                                None => match ["torso", "body", "chest", "upper_body"].iter().find(|n| slots.iter().any(|x| x == *n)) {
+                                    Some(n) => vec![n.to_string()],
+                                    None => bail!("pass body: the slots that rise when breathing (usually the torso; its children follow)"),
+                                },
+                            };
+                            for b in body.iter().chain(&a.lag) {
+                                need(b)?;
+                            }
+                            // 1px breath: rest, rest, up x4, rest, rest
+                            let lift = [0, 0, -1, -1, -1, -1, 0, 0];
+                            let mut frames = vec![];
+                            for i in 0..lift.len() {
+                                let prev = lift[(i + lift.len() - 1) % lift.len()];
+                                let mut keys: Vec<Key> = body.iter().filter(|_| lift[i] != 0).map(|b| Key { slot: b.clone(), dy: lift[i], ..Default::default() }).collect();
+                                for l in &a.lag {
+                                    // loose bits (hat, hair, ears) arrive one frame late
+                                    let dy = if body.iter().any(|b| descends(l, b)) { prev - lift[i] } else { prev };
+                                    if dy != 0 {
+                                        keys.push(Key { slot: l.clone(), dy, ..Default::default() });
+                                    }
+                                }
+                                frames.push(Frame::rig(ms, keys));
+                            }
+                            if let Some(bl) = &a.blink {
+                                need(&bl.slot)?;
+                                if let Some(p) = &bl.part {
+                                    s.part(p)?;
+                                }
+                                let mut f = frames[5].clone();
+                                f.duration_ms = 110;
+                                f.keys.push(Key {
+                                    slot: bl.slot.clone(),
+                                    part: bl.part.clone(),
+                                    hide: if bl.part.is_none() { Some(false) } else { None },
+                                    ..Default::default()
+                                });
+                                frames.insert(6, f);
+                            }
+                            (name, frames, String::new())
+                        }
+                        "walk" => {
+                            let name = a.anim.clone().unwrap_or_else(|| "walk".into());
+                            let legs = a.legs.clone().ok_or_else(|| anyhow!("walk needs legs: [near_leg_slot, far_leg_slot]"))?;
+                            for l in &legs {
+                                need(l)?;
+                            }
+                            if let Some(ar) = &a.arms {
+                                for x in ar {
+                                    need(x)?;
+                                }
+                            }
+                            let n = a.frames.unwrap_or(8).clamp(4, 32);
+                            let ms = a.ms.unwrap_or(100).clamp(30, 2000);
+                            let swing = a.swing.unwrap_or(22.0).clamp(0.0, 60.0);
+                            let arm_swing = a.arm_swing.unwrap_or(18.0).clamp(0.0, 90.0);
+                            let leg_rest = s.rig.iter().find(|p| p.slot() == legs[0]).unwrap();
+                            let lp = s.part(&leg_rest.part)?;
+                            let leg_len = (lp.img.height() as f32 - lp.pivot[1]).max(1.0);
+                            let roots: Vec<String> = s.rig.iter().filter(|p| p.parent.is_none()).map(|p| p.slot().to_string()).collect();
+                            let mut frames = vec![];
+                            // lowest opaque row of a frame (measured, so rotated toes and heels count)
+                            let lowest = |f: &Frame| -> Result<Option<i32>> {
+                                let img = render::compose_margin(s, f, 64)?;
+                                Ok((0..img.height()).rev().find(|y| (0..img.width()).any(|x| img.get_pixel(x, *y)[3] > 0)).map(|y| y as i32 - 64))
+                            };
+                            for i in 0..n {
+                                let sa = (i as f32 / n as f32 * std::f32::consts::TAU).sin();
+                                let ang = swing * sa;
+                                let mut keys = vec![
+                                    Key { slot: legs[0].clone(), rot: ang, ..Default::default() },
+                                    Key { slot: legs[1].clone(), rot: -ang, ..Default::default() },
+                                ];
+                                if let Some(ar) = &a.arms {
+                                    keys.push(Key { slot: ar[0].clone(), rot: -arm_swing * sa, ..Default::default() });
+                                    keys.push(Key { slot: ar[1].clone(), rot: arm_swing * sa, ..Default::default() });
+                                }
+                                // a swung leg changes how low the feet reach: move everything so the lowest
+                                // pixel sits on the floor row (origin y - 1) in every frame
+                                let drop = match lowest(&Frame::rig(ms, keys.clone()))? {
+                                    Some(low) => s.origin[1] - 1 - low,
+                                    None => 0,
+                                };
+                                if drop != 0 {
+                                    for r in &roots {
+                                        match keys.iter_mut().find(|k| &k.slot == r) {
+                                            Some(k) => k.dy += drop,
+                                            None => keys.push(Key { slot: r.clone(), dy: drop, ..Default::default() }),
+                                        }
+                                    }
+                                }
+                                keys.retain(|k| !k.is_noop());
+                                frames.push(Frame::rig(ms, keys));
+                            }
+                            let stride = 2.0 * leg_len * swing.to_radians().sin();
+                            let speed = 2.0 * stride / (n as f32 * ms as f32 / 1000.0);
+                            (
+                                name,
+                                frames,
+                                format!(
+                                    "\nmove the character about {speed:.0} px/s ({:.1} px per frame) in the game so the feet don't slide; anim_copy mirror=true makes the other direction",
+                                    2.0 * stride / n as f32
+                                ),
+                            )
+                        }
+                        p => bail!("unknown preset '{p}' (idle, walk)"),
+                    };
+                    check_name("animation", &name)?;
+                    let count = frames.len();
+                    s.animations.insert(name.clone(), Animation { looped: true, frames });
+                    Self::check_anims(s)?;
+                    Ok(vec![
+                        Out::Text(format!(
+                            "'{name}': {count} rig frames generated{note}\nrefine with pose_set (slot=..., frames=[...]) or swap parts for drawn poses"
+                        )),
+                        anim_strip(s, &name, 32)?,
+                    ])
+                })
+            }
             "undo" | "redo" => {
                 let a: SpriteRef = parse(args)?;
                 let d = self.doc(&a.sprite)?;
@@ -1218,20 +1849,41 @@ pub fn definitions() -> Vec<Value> {
     ]}});
     let pose = json!({"type": "object", "properties": {
         "part": {"type": "string"},
-        "x": {"type": "integer", "description": "canvas x where the part's pivot goes"},
+        "slot": {"type": "string", "description": "stable name of this placement (default: the part name); parents and keys refer to it"},
+        "parent": {"type": "string", "description": "slot this part hangs from: x/y become the offset from the parent's pivot, rotation and flips are inherited"},
+        "x": {"type": "integer", "description": "canvas x where the part's pivot goes (or offset from the parent's pivot)"},
         "y": {"type": "integer"},
         "rot": {"type": "number", "description": "degrees clockwise around the pivot"},
-        "flip_h": {"type": "boolean"}, "flip_v": {"type": "boolean"}
+        "flip_h": {"type": "boolean"}, "flip_v": {"type": "boolean"},
+        "hide": {"type": "boolean", "description": "don't draw (children still follow), e.g. blink lids in the rest pose"}
     }, "required": ["part"]});
-    let frame = json!({"type": "object", "properties": {
+    let key = json!({"type": "object", "properties": {
+        "slot": {"type": "string"},
+        "dx": {"type": "integer"}, "dy": {"type": "integer"},
+        "rot": {"type": "number", "description": "degrees added to the rest rotation"},
+        "part": {"type": "string", "description": "draw this part instead (mouth_a, eyes_closed, arm_bent)"},
+        "hide": {"type": "boolean", "description": "true hides, false shows a slot hidden in the rest pose"},
+        "flip_h": {"type": "boolean"}, "flip_v": {"type": "boolean"},
+        "z": {"type": "integer", "description": "new draw index (0 = back)"}
+    }, "required": ["slot"]});
+    let frame = json!({"type": "object", "description": "Explicit frame: poses (back to front). Rig frame: no poses, only keys = changes to the rig's rest pose.", "properties": {
         "duration_ms": {"type": "integer", "default": 100},
-        "poses": {"type": "array", "items": pose, "description": "back to front"}
-    }, "required": ["poses"]});
+        "poses": {"type": "array", "items": pose, "description": "back to front"},
+        "keys": {"type": "array", "items": key, "description": "rig frames: changes to the rest pose; slots without a key stay at rest"},
+        "flip_h": {"type": "boolean", "description": "mirror the whole frame around the origin x"}
+    }});
     let op = json!({"type": "object", "description":
         "Drawing op, discriminated by 'op':\n\
          {op:'rows', x?, y?, rows:[str], legend?:{char:color}, erase_dots?} — paint/patch a pixel block; chars = palette keys, legend chars override, '.'/' ' = unchanged (erase if erase_dots), '_' = erase\n\
          {op:'pixels', points:[[x,y]...], color}\n\
-         {op:'line', points:[[x,y],[x,y],...], color} — polyline\n\
+         {op:'line', points:[[x,y],[x,y],...], color, clean?} — polyline; clean = pixel-perfect (no doubled corners)\n\
+         {op:'curve', points:[[x,y]...], color, kind?:'spline'|'bezier', closed?, fill?, stroke?, clean? (default true), pattern?, color2?} — smooth organic line \
+         through the points (spline) or with control points (bezier: 3, 4, 7, 10.. points); closed+fill paints the inside with color and the edge with stroke ('none' = no edge)\n\
+         {op:'mirror', axis?:'x'|'y', at?, from?:'left'|'right'|'top'|'bottom'} — copy one half onto the other (symmetric faces/bodies), at = mirror line (default middle)\n\
+         {op:'shade', light?:[dx,dy] (default [-1,-1] = top-left), depth?:1, highlight?:0, steps?:1, colors?, rect?, edge?:'ramp'|'color'|'alpha'} — \
+         cel shading along palette ramps: pixels within depth of their region's far side get darker, within highlight of the lit side lighter\n\
+         {op:'ramp', steps, rect?, points?, colors?} — step pixels along their ramp (negative = darker)\n\
+         {op:'contour', of, color?|selout?, against?, diagonal?} — inner lines: pixels of color 'of' touching another color become color (selout: darkest of of's ramp)\n\
          {op:'rect', x,y,w,h, color, fill?, pattern?, color2?}\n\
          {op:'ellipse', x,y,w,h, color, fill?, pattern?, color2?} — bounding box\n\
          {op:'polygon', points:[[x,y]...], color, fill? (default true), pattern?, color2?}\n\
@@ -1243,7 +1895,7 @@ pub fn definitions() -> Vec<Value> {
          {op:'flip', h?, v?}\n\
          {op:'clear', rect?:[x,y,w,h]}\n\
          {op:'copy', from:[x,y,w,h], to:[x,y]}",
-        "properties": {"op": {"type": "string", "enum": ["rows","pixels","line","rect","ellipse","polygon","fill","replace","outline","shift","flip","clear","copy"]}},
+        "properties": {"op": {"type": "string", "enum": ["rows","pixels","line","curve","rect","ellipse","polygon","fill","replace","outline","contour","shade","ramp","mirror","shift","flip","clear","copy"]}},
         "required": ["op"]});
 
     vec![
@@ -1307,7 +1959,7 @@ pub fn definitions() -> Vec<Value> {
         tool("frame_clone", "Duplicate a frame (count times), inserted at 'to' (default right after it). Then tweak with pose_set.", json!({
             "sprite": sprite, "anim": {"type": "string"}, "index": {"type": "integer"}, "to": {"type": "integer"}, "count": {"type": "integer"}
         }), &["sprite", "anim", "index"]),
-        tool("review", "One control sheet for self-review: 1:1 size, black silhouette (readability check), zoom with pixel grid + coordinate labels, and (for animations) all frames in a strip. grid_text=true also returns the composed frame as text rows.", json!({
+        tool("review", "One control sheet for self-review: 1:1 size, black silhouette (does the pose read?), value study (grayscale by perceived lightness: do face, hands and clothes separate?), zoom with pixel grid + coordinate labels, and (for animations) all frames in a strip. grid_text=true also returns the composed frame as text rows.", json!({
             "sprite": sprite, "part": {"type": "string"}, "anim": {"type": "string"}, "frame": {"type": "integer"},
             "zoom": {"type": "integer"}, "grid_text": {"type": "boolean"}, "palette": {"type": "string", "description": "palette variant name"}
         }), &["sprite"]),
@@ -1315,12 +1967,44 @@ pub fn definitions() -> Vec<Value> {
             "sprite": sprite, "outline": {"type": "string", "description": "outline color/key (default: darkest palette color)"}
         }), &["sprite"]),
         tool("frame_delete", "Delete a frame.", json!({"sprite": sprite, "anim": {"type": "string"}, "index": {"type": "integer"}}), &["sprite", "anim", "index"]),
-        tool("pose_set", "Tweak one part's pose across frames (all frames if 'frames' omitted): absolute x/y/rot/flips, relative dx/dy, swap the part (replace_with, e.g. mouth_closed -> mouth_open), reorder (z = draw index), or remove. Adds the pose if missing.", json!({
+        tool("pose_set", "Tweak one part's pose across frames (all frames if 'frames' omitted): absolute x/y/rot/flips, relative dx/dy, swap the part (replace_with, e.g. mouth_closed -> mouth_open), reorder (z = draw index), or remove. Explicit frames: pass part (adds the pose if missing). Rig frames: pass slot; this edits the frame's key, x/y/rot are the slot's local values (offset from rest is stored), remove hides it.", json!({
             "sprite": sprite, "anim": {"type": "string"}, "frames": {"type": "array", "items": {"type": "integer"}},
-            "part": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "dx": {"type": "integer"}, "dy": {"type": "integer"},
+            "part": {"type": "string"}, "slot": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "dx": {"type": "integer"}, "dy": {"type": "integer"},
             "rot": {"type": "number"}, "flip_h": {"type": "boolean"}, "flip_v": {"type": "boolean"},
             "replace_with": {"type": "string"}, "z": {"type": "integer"}, "remove": {"type": "boolean"}
-        }), &["sprite", "anim", "part"]),
+        }), &["sprite", "anim"]),
+        tool("rig_set", "Set the character's rest pose: every slot (back to front) with its part, position and parent. Children hang from their parent's pivot, so moving or turning the torso carries head, arms, mouth and hat along. Frames without poses are then drawn from the rig plus their keys, so animations only list what changes. Returns the rest pose with pivots marked.", json!({
+            "sprite": sprite, "poses": {"type": "array", "items": pose, "description": "back to front; roots use canvas coordinates, children offsets from their parent's pivot"}
+        }), &["sprite", "poses"]),
+        tool("palette_ramp", "Add or replace a hue-shifted shading ramp built from one base color: shadows drift cool (violet), highlights warm (yellow) with less chroma. This is the standard pixel-art ramp instead of flat darker/lighter copies. keys = one char per shade, dark to light. Existing keys are recolored in place.", json!({
+            "sprite": sprite, "name": {"type": "string", "description": "ramp group, e.g. skin, jacket"},
+            "base": {"type": "string", "description": "#rrggbb, the mid tone"},
+            "keys": {"type": "string", "description": "e.g. 'abcd' (dark -> light)"},
+            "base_index": {"type": "integer", "description": "which shade is the base (default: middle)"},
+            "hue_shift": {"type": "number", "description": "degrees of hue drift per step (default 12)"},
+            "step": {"type": "number", "description": "lightness between shades, OKLab L (default 0.1)"},
+            "outline": {"type": "string", "description": "extra key for a deep tinted outline shade in this ramp; outline selout then draws colored DOTT-style lines that hold against any background"}
+        }), &["sprite", "name", "base", "keys"]),
+        tool("anim_talk", "Lip-sync: build a talk animation from a line of dialogue on a rig. Letters map to mouth shapes (A, E, O, M, F, L, C, rest) found as parts named <slot>_a, <slot>_e, <slot>_o, <slot>_m, <slot>_f, <slot>_l, <slot>_c, <slot>_rest (missing ones fall back to similar shapes), or given via visemes. Punctuation adds pauses; head bobs on open vowels.", json!({
+            "sprite": sprite, "text": {"type": "string"}, "anim": {"type": "string", "description": "default 'talk'"},
+            "slot": {"type": "string", "description": "mouth slot in the rig (default 'mouth')"},
+            "visemes": {"type": "object", "description": "{\"A\": \"mouth_open\", \"M\": \"mouth_closed\", ...}"},
+            "ms": {"type": "integer", "description": "time per letter (default 75)"},
+            "head": {"type": "string", "description": "slot to bob 1px on A/O"},
+            "loop": {"type": "boolean", "default": false}
+        }), &["sprite", "text"]),
+        tool("anim_generate", "Generate a starting animation on a rig, then refine it. preset 'idle': 1px breathing of the body slots, with lag slots (hat, hair) arriving a frame late and an optional blink (swap to a closed-eyes part, or show a hidden lids slot). preset 'walk' (side view): legs swing in opposite directions, arms counter-swing, and the body drops so the feet stay on the floor; it reports the walk speed that avoids sliding.", json!({
+            "sprite": sprite, "preset": {"type": "string", "enum": ["idle", "walk"]}, "anim": {"type": "string"},
+            "ms": {"type": "integer", "description": "frame duration (idle 180, walk 100)"},
+            "body": {"type": "array", "items": {"type": "string"}, "description": "idle: slots that rise (default torso/body)"},
+            "lag": {"type": "array", "items": {"type": "string"}, "description": "idle: slots that follow one frame late"},
+            "blink": {"type": "object", "properties": {"slot": {"type": "string"}, "part": {"type": "string"}}, "required": ["slot"]},
+            "legs": {"type": "array", "items": {"type": "string"}, "description": "walk: [near_leg, far_leg] slots, pivots at the hips"},
+            "arms": {"type": "array", "items": {"type": "string"}, "description": "walk: [near_arm, far_arm] slots, pivots at the shoulders"},
+            "swing": {"type": "number", "description": "walk: leg swing degrees (default 22)"},
+            "arm_swing": {"type": "number", "description": "walk: arm swing degrees (default 18)"},
+            "frames": {"type": "integer", "description": "walk: frames per cycle (default 8)"}
+        }), &["sprite", "preset"]),
         tool("anim_delete", "Delete an animation.", json!({"sprite": sprite, "anim": {"type": "string"}}), &["sprite", "anim"]),
         tool("anim_copy", "Copy an animation; mirror=true flips it horizontally (walk_right -> walk_left), reverse=true reverses frame order.", json!({
             "sprite": sprite, "from": {"type": "string"}, "to": {"type": "string"}, "mirror": {"type": "boolean"}, "reverse": {"type": "boolean"}
